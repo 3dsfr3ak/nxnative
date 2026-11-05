@@ -14,6 +14,7 @@
 # Names are the guest names: a host name chosen on a case collision (.dm-case-N) is replaced by the one in its xattr, as hle_fs.c's guest_name does.
 # Usage: romfs_image.py [--reuse] <RomFS folder> <out image>   (written to <out>.part, renamed at the end)
 # --reuse checks the source tree's names and file metadata, the packer's version and the image's identity before keeping a previous image.
+# A profile's rsizetable_margin widens the game's resource size table as it is written: a workaround, see widen_size_table.
 import argparse, hashlib, json, os, struct, subprocess
 from pathlib import Path
 
@@ -29,10 +30,14 @@ def guest(parent, name):
     return r.stdout.rstrip('\n') if r.returncode == 0 else name
 
 
+ARTIFACTS = {'.listing'}   # a dump tool's files, not game files (wget over FTP leaves one per folder; as pack_nup.py's): Nintendo Switch Sports Resort lists its parameter folders and takes every entry for a parameter, so one stops its boot
+
+
 def children(path):
     out = []
     with os.scandir(path) as it:
         for e in it:
+            if e.name in ARTIFACTS: continue
             out.append((guest(path, e.name).encode(), e.path, e.is_dir(follow_symlinks=True)))
     out.sort()
     return out
@@ -63,6 +68,25 @@ def source_digest(src, ents):
         h.update(struct.pack('<I?', len(name), isdir)); h.update(name)
         h.update(json.dumps(file_identity(path)).encode() + b'\0')
     return h.hexdigest()
+
+
+def size_table(rel):   # whether a RomFS-relative path is a resource size table
+    return rel.startswith('System/Resource/ResourceSizeTable') and rel.endswith('.rsizetable.zs')
+
+
+def widen_size_table(data, margin):
+    """A zstd-compressed RESTBL (the game sizes each resource's heap from it) with margin added to every entry. WORKAROUND, cause open: Nintendo Switch Sports Resort's Npc_Integration
+    model heaps come up 65-80 bytes short on this host and it then uses a null memory pool; why they fit on a console is unknown (dm/games/04008E001F098000/README.md)"""
+    try: from compression import zstd
+    except ImportError: from backports import zstd
+    t = bytearray(zstd.decompress(data))
+    if t[:6] != b'RESTBL': raise RuntimeError('a resource size table without its RESTBL magic')
+    name_len, crcs, names = struct.unpack_from('<III', t, 10)
+    end = 22 + crcs * 8 + names * (name_len + 4)
+    if end != len(t): raise RuntimeError(f'a resource size table of {len(t)} bytes, its header says {end}')
+    for o in range(26, 22 + crcs * 8, 8): struct.pack_into('<I', t, o, struct.unpack_from('<I', t, o)[0] + margin)
+    for o in range(22 + crcs * 8 + name_len, end, name_len + 4): struct.pack_into('<I', t, o, struct.unpack_from('<I', t, o)[0] + margin)
+    return zstd.compress(bytes(t), level=19)
 
 
 def reusable(dst, digest):   # whether dst is the image the stamp beside it says was made from inputs with this digest
@@ -100,14 +124,24 @@ def copy_file(path, out):
     return n
 
 
-def pack(src, dst, reuse=False):
+def pack(src, dst, reuse=False, size_table_margin=0):
     src, dst = os.fspath(src), os.fspath(dst)
     ents = entries(src)
-    digest = source_digest(src, ents)
+    source = digest = source_digest(src, ents)
+    if size_table_margin: digest = hashlib.sha256(f'{digest} size table margin {size_table_margin}'.encode()).hexdigest()
     if reuse and reusable(dst, digest): return len(ents)
-    part = write(ents, dst, copy_file)
+    widened = 0
+    def copy(path, out):
+        nonlocal widened
+        if not size_table_margin or not size_table(Path(path).relative_to(src).as_posix()): return copy_file(path, out)
+        widened += 1
+        return out.write(widen_size_table(Path(path).read_bytes(), size_table_margin))
+    part = write(ents, dst, copy)
+    if size_table_margin and not widened:
+        os.unlink(part)
+        raise RuntimeError('the profile has a rsizetable_margin, but this RomFS has no resource size table')
     # A changing source must not publish a mixed image or a reuse stamp for stale data.
-    if source_digest(src, entries(src)) != digest:
+    if source_digest(src, entries(src)) != source:
         os.unlink(part)
         raise RuntimeError('RomFS changed while packing; run the packer again when its files are stable')
     publish(part, dst, digest)

@@ -266,6 +266,14 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Fix:** the host logs each output as `audio #N`: the open with its call site, Start / Stop / Close (the first 32 per output), and the callback statistics normally every 2000 of that output's callbacks, through the [watchdog](#periodic-diagnostics-outside-the-audiounit-callback).
 - **Found on:** [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md).
 
+### Output streams (SDK 22)
+
+- **Symptom:** the game aborts on the `auddmg:u` service when it opens an output stream (`nn::audio::OpenOutputStream`); with a stand-in that only paces it, a movie plays with no sound.
+- **Cause:** SDK 22's output streams and virtual output devices reach a service the host does not serve, and a stream's frames go straight to the device rather than through the renderer.
+- **Fix:** `hle_audren.c`. A stream is a host PCM output, as the renderer's (`dm_pcmout_*`, a line `audio #N` of its own). `WriteOutputStream` fills blocks of at least 240 frames, the blocks handed back once played make the room `GetOutputStreamFreeFrameCount` reports, so the device paces the game, and `StopOutputStream` lets a part-filled block out. The output takes 16-bit at 48 kHz, one or two channels, and up to 4 streams at once; any other stream is silent and paced by the clock. The stream's event is signalled at its period.
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md): its menu movie, 2 channels, 960 frames, period 480.
+- **Check:** `t_audren_work`.
+
 ### Checking audio without listening
 
 `DM_AUDIO_DUMP=file` writes the PCM the host plays (16-bit, 48 kHz, stereo). RMS per second, clipping share, spectral flatness (music ≈ 0.1–0.5, white noise ≈ 0.85) and the strongest FFT peaks (they should land on musical notes) tell real music from noise or silence.

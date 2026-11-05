@@ -10,13 +10,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-typedef struct hid_pad { IOHIDDeviceRef hid; pad_hid st; char name[64]; struct hid_pad *next; } hid_pad;
+typedef struct hid_pad { IOHIDDeviceRef hid; pad_hid st; char name[64]; struct joycon_dev *jc; struct hid_pad *next; } hid_pad;   // jc: a Joy-Con (joycon_mac.h), read by its reports
 static IOHIDManagerRef g_hidpad_manager;
 static hid_pad *g_hidpads;
 static int g_hidpad_log;
 static void hidpad_attach(hid_pad *d);
 static void hidpad_detach(hid_pad *d);
 static void hidpad_read(hid_pad *d);
+static int hidpad_slot(hid_pad *d);            // its player, -1 for none
+static int hidpad_motion_player(hid_pad *d);   // the same while the game has the input, else -1
+#include "joycon_mac.h"
 
 static void hidpad_value(void *ctx, IOReturn result, void *sender, IOHIDValueRef v) {
     (void)sender;
@@ -40,6 +43,7 @@ static void hidpad_found(void *ctx, IOReturn result, void *sender, IOHIDDeviceRe
     (void)ctx; (void)sender;
     if (result != kIOReturnSuccess || IOHIDDeviceGetProperty(hid, CFSTR(kIOHIDGCSyntheticDeviceKey)) == kCFBooleanTrue) return;
     for (hid_pad *d = g_hidpads; d; d = d->next) if (d->hid == hid) return;
+    if (joycon_found(hid)) return;   // GameController lists a lone Joy-Con too, but with no profile front_mac.m can read
     if ([GCController supportsHIDDevice:hid]) return;   // front_mac.m reads it through its GCController (once per device: the call is not cheap)
     NSNumber *vendor = (__bridge NSNumber *)IOHIDDeviceGetProperty(hid, CFSTR(kIOHIDVendorIDKey)), *product = (__bridge NSNumber *)IOHIDDeviceGetProperty(hid, CFSTR(kIOHIDProductIDKey));
     int vid = vendor.intValue, pid = product.intValue;
@@ -64,6 +68,7 @@ static void hidpad_removed(void *ctx, IOReturn result, void *sender, IOHIDDevice
     hid_pad *d = *link; *link = d->next;
     IOHIDDeviceRegisterInputValueCallback(hid, NULL, NULL);
     hidpad_detach(d);
+    if (d->jc) joycon_removed(d);
     CFRelease(d->hid); free(d);
 }
 static void hidpad_start(void) {
@@ -72,7 +77,8 @@ static void hidpad_start(void) {
     g_hidpad_manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone); if (!g_hidpad_manager) return;
     IOHIDManagerSetDeviceMatchingMultiple(g_hidpad_manager, (__bridge CFArrayRef)@[
         @{@kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop), @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_GamePad)},
-        @{@kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop), @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_Joystick)}]);
+        @{@kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop), @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_Joystick)},
+        @{@kIOHIDVendorIDKey: @(JC_VENDOR), @kIOHIDProductIDKey: @(JC_PRODUCT_RIGHT)}]);
     IOHIDManagerRegisterDeviceMatchingCallback(g_hidpad_manager, hidpad_found, NULL);
     IOHIDManagerRegisterDeviceRemovalCallback(g_hidpad_manager, hidpad_removed, NULL);
     IOHIDManagerScheduleWithRunLoop(g_hidpad_manager, CFRunLoopGetMain(), kCFRunLoopCommonModes);

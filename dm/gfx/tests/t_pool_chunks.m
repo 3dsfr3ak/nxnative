@@ -52,6 +52,15 @@ int main(void) { @autoreleasepool {
     CHECK("a long range in one buffer", big.length >= 100 * MB && g_npool == n1 + 1);
     id<MTLBuffer> again = look(base + 300 * MB + 4096, 4096);
     CHECK("its stride keeps the long chunk", again == big);
+    // A check that only asks whether storage exists (tex_storage_live, for each ID of a bindless texture table): no chunk, nothing wired
+    int n4 = g_npool, r4 = g_pool_res_n; uint64_t held = base + 700 * MB;
+    CHECK("in the pool: held", pool_holds(held, 64 * MB));
+    CHECK("past its end: not held", !pool_holds(base + GB - 8, 64));
+    CHECK("in no pool: not held", !pool_holds(4096, 16));
+    tex_t stored; memset(&stored, 0, sizeof stored); stored.mem = (void *)(uintptr_t)held; stored.L.size = 64 * MB;
+    CHECK("a texture there is live", tex_storage_live(&stored));
+    CHECK("no chunk for asking", g_npool == n4 && !g_big[0].chunk[(held - g_big[0].a) >> 24]);
+    CHECK("nothing wired for asking", g_pool_res_n == r4);
     // The pool's end
     CHECK("past the end: not found", !mtl_gpu_addr(base + GB - 8, 64, &mb, &mo, &gpu));
     CHECK("at the end: found", mtl_gpu_addr(base + GB - 8, 8, &mb, &mo, &gpu));
@@ -73,13 +82,60 @@ int main(void) { @autoreleasepool {
     CHECK("the texture holds what the pool holds", !memcmp(rb.contents, lin, 256 * 256 * 4));
     free(lin);
     mtl_tex_release(&t);
-    // Raw global memory: the table reaches all of it, and lookups then have the whole pool
+    // Raw global memory reaches what the game asked an address for. Nothing asked: the pool stays in parts, and the table adds no chunk
+    int n5 = g_npool;
     mtl_sub_begin(); CHECK("pool table made", gmem_map_gpu() != 0); finish();
-    CHECK("the whole pool has an entry", g_big[0].full > 0 && g_pools[g_big[0].full - 1].end == base + GB);
+    CHECK("nothing asked: no whole-pool entry", !g_big[0].full);
+    CHECK("nothing asked: no new chunk", g_npool == n5);
+    // A buffer's address: its stride joins the table
+    uint64_t asked = base + 800 * MB + 4096; uintptr_t stride = (asked - g_big[0].a) >> 24;
+    CHECK("not reached yet", !g_big[0].chunk[stride]);
+    uint64_t gen0 = atomic_load(&g_pool_gen); mtl_pool_asked(mem, asked, 4096); CHECK("a new part asked changes the pools", atomic_load(&g_pool_gen) != gen0);
+    mtl_sub_begin(); gmem_map_gpu(); finish();
+    CHECK("asked: its stride has a chunk, still in parts", g_big[0].chunk[stride] && !g_big[0].full);
+    int in_table = 0; const uint64_t *te = (const uint64_t *)g_gmem_buf.contents;
+    for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) { const uint64_t *e = te + k * DMSH_GMEM_MAP_ENTRY / 8; if (e[0] <= asked && asked < e[1]) in_table = 1; }
+    CHECK("asked: the table holds it", in_table);
+    gen0 = atomic_load(&g_pool_gen); mtl_pool_asked(mem, asked, 4096); CHECK("asked again: nothing changes", atomic_load(&g_pool_gen) == gen0);
+    mtl_pool_asked(mem, base + GB + 4096, 16); CHECK("outside the pool: nothing changes", atomic_load(&g_pool_gen) == gen0);
+    // Half its strides asked: two-stride chunks would count for more than the pool, so one buffer
+    mtl_pool_asked(mem, base, GB / 2);
+    mtl_sub_begin(); gmem_map_gpu(); finish();
+    CHECK("half asked: the whole pool has an entry", g_big[0].full > 0 && g_pools[g_big[0].full - 1].end == base + GB);
     CHECK("lookups take it", look(base + 900 * MB, 4096).length == GB);
+    // The pool's own address: all of it, at once
+    uint8_t *mem2 = mmap(NULL, GB, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (mem2 == MAP_FAILED) abort();
+    mtl_pool_add(mem2, GB); mtl_pool_asked(mem2, 0, 0);
+    mtl_sub_begin(); gmem_map_gpu(); finish();
+    CHECK("the pool's address asked: the whole pool has an entry", g_nbig == 2 && g_big[1].full > 0);
+    mtl_pool_del(mem2); munmap(mem2, GB); CHECK("that pool is gone", g_nbig == 1);
+    // The texture table: within the budget the walk makes them; past it only those whose handles a bound buffer holds
+    tex_t named = t, unnamed = t, nosamp = t; named.serial = 99701; named.mem = mem + 720 * MB; unnamed.serial = 99702; unnamed.mem = mem + 724 * MB; nosamp.serial = 99703; nosamp.mem = mem + 728 * MB;
+    mtl_reg_tex(7, &named, NULL); mtl_reg_tex(8, &unnamed, NULL); mtl_reg_tex(9, &nosamp, NULL);
+    samp_par sp; memset(&sp, 0, sizeof sp); mtl_reg_samp(3, &sp);
+    pool_walk_decide(0, g_ntreg, 1001); CHECK("within the budget: it walks", !g_pool_sparse && g_pool_walked == 3 * t.L.size);
+    pool_walk_decide(0, g_ntreg, 1001); CHECK("the same registrations are not counted twice", g_pool_walked == 3 * t.L.size);
+    g_pool_walked = g_dev.recommendedMaxWorkingSetSize / 8; pool_walk_decide(0, g_ntreg, 1002); CHECK("past the budget: it stops", g_pool_sparse);
+    __unsafe_unretained id<MTLBuffer> pb = nil; mtl_sub_begin();
+    (void)pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &pb);
+    CHECK("past the budget: the walk makes none", !tex_get(named.serial) && !tex_get(unnamed.serial));
+    const uint64_t *tab = (const uint64_t *)((const uint8_t *)pb.contents + DMSH_POOL_HEAD); uint64_t none = tab[7];
+    uint32_t *words = (uint32_t *)(mem + 730 * MB); words[0] = 1234; words[1] = 7u | 3u << 20; words[2] = 8u; words[3] = 9u | 5u << 20;   // a number, a handle, an ID with no sampler, a sampler nothing registered
+    S.ssbo[0][1] = (p_bind_buf){0, 1, (uint64_t)(uintptr_t)words, 16};
+    CHECK("the bound buffer names one", pool_scan_bound(0));
+    CHECK("its texture is made", tex_get(named.serial) != NULL);
+    CHECK("a word with no sampler or a sampler not registered is no handle", !tex_get(unnamed.serial) && !tex_get(nosamp.serial));
+    (void)pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &pb); tab = (const uint64_t *)((const uint8_t *)pb.contents + DMSH_POOL_HEAD);
+    CHECK("the table holds it now", tab[7] != none && tab[8] == none);
+    words[2] = 8u | 3u << 20; CHECK("once a frame", !pool_scan_bound(0));
+    atomic_fetch_add(&g_cur_frame, 1); CHECK("the next frame reads it again", pool_scan_bound(0) && tex_get(unnamed.serial) != NULL);
+    finish();
+    S.ssbo[0][1] = (p_bind_buf){0};
+    mtl_reg_tex(7, NULL, NULL); mtl_reg_tex(8, NULL, NULL); mtl_reg_tex(9, NULL, NULL); mtl_tex_release(&named); mtl_tex_release(&unnamed); g_pool_sparse = 0; g_pool_walked = 0;
     // A smaller pool is one buffer, and the removal of the large one takes all its entries
     uint8_t *small = mmap(NULL, 64 * MB, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (small == MAP_FAILED) abort();
     int n3 = g_npool; mtl_pool_add(small, 64 * MB); CHECK("one entry", g_npool == n3 + 1 && g_nbig == 1);
+    CHECK("asking does not wire a small pool either", pool_holds((uint64_t)(uintptr_t)small + 10, 16) && !g_pools[g_npool - 1].res);
     CHECK("its buffer is the whole pool", look((uint64_t)(uintptr_t)small + 10, 16).length == 64 * MB);
     mtl_pool_del(mem); mtl_drain();
     CHECK("no large pool left", g_nbig == 0);

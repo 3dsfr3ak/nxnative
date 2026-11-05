@@ -14,5 +14,7 @@ Three projects from Ryujinx 1.3.2: `Ryujinx.Graphics.Shader`, `Ryujinx.Common` a
 
 - `Ryujinx.Graphics.Shader/Instructions/InstEmitSurface.cs`, `IntermediateRepresentation/TextureFlags.cs` and `CodeGen/Spirv/Instructions.cs`: the Metal path (`TranslationFlags.MetalImageAtomics`) bounds image atomics before forming the texel pointer, which SPIRV-Cross writes as a native texture atomic (MSL 3.1) on buffer, 2D, 2D-array and 3D images. Returning `IGN` atomics preserve the old texel on the valid edge and return zero outside the image; CAS is a native texture compare-exchange behind the same guard; predicate results and non-IGN modes remain rejected. See [bounds of image atomics](../../../docs/reference/shaders.md#bounds-of-image-atomics) and [image atomics](../../../docs/reference/shaders.md#image-atomics), found on SHIN MEGAMI TENSEI V: Vengeance's particle counters.
 
+- `Ryujinx.Graphics.Shader/Instructions/InstEmitMove.cs` and `Decoders/InstDecoders.cs`: special register 132, the fragment's shading rate, reads a 1x1 fragment, and a register still unknown logs that it reads as 0.
+
 The shader translation tool in `dm/gfx/tools/dmsh_xlate` references them to translate the original Switch shaders to SPIR-V.
 License: MIT, see `LICENSE.txt`. Upstream: <https://github.com/Ryubing>.

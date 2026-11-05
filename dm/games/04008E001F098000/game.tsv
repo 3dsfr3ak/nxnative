@@ -1,0 +1,27 @@
+# Nintendo Switch Sports Resort (Switch 2): the keys its files decide, plus what the other Nintendo EPD games on NVN2 needed. A first profile: see README.md for what is checked
+title_id	04008E001F098000
+program_id	04008E001F098000
+name	Nintendo Switch Sports Resort
+ipa	NintendoSwitchSportsResort.ipa
+app_category	public.app-category.sports-games
+pad_layout	full
+build	v0	1.0.0	main=9043181847fa5850ff484edf282803d1	subsdk0=ecf61f74a892d5b55be2ad09888179ed	sdk=5fd6d40b36fb19c82ef24a03dbcb474c
+build	v65536	1.1.0	main=3941550a42845731651bcd05edbb4703	subsdk0=d5bc474e0cefa2140efbe3a300aff60d	sdk=0c5ec6021e995368f68fba79c3ed0c5b
+package	v65536
+shader_versions	v65536
+# main takes nothing from subsdk1 (nn::camera), subsdk2, subsdk3 (C / libc) or subsdk4 (C++) that the host does not supply (profile_guess.py)
+modules	main subsdk0 sdk
+romfs_marker	System/RegionLangMask.txt
+# A workaround, cause open: Npc_Integration model heaps come up 65-80 bytes short (README.md)
+rsizetable_margin	0x100
+zip_store	.zs:.bwav:.webm:.metallib
+# The game asks SetHeapSize for 0x1de400000 (7.5 GB) in nninitStartup: a 4 GB alias region and an 8 GB heap region. The alias size is Splatoon Raiders', not measured here. The NPDM declares a 32 MB system resource
+mem_reserve	0x610000000
+mem_alias	0x400000000
+mem_stack	0x10000000
+app_pool	0x240000000
+sys_resource	0x2000000
+shader_groups	/Shader/=shader /Effect/=effect /Layout/=layout
+shader_note	Nintendo Switch Sports Resort shaders
+# Not checked on this game yet: the sead / agl engine of Mario Kart World and Splatoon Raiders wraps its clears in render conditions
+render_cond	on

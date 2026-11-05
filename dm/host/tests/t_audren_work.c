@@ -13,8 +13,9 @@ static int work_alloc(void **out, size_t align, size_t size) {
     if (!r) { assert(!backing); backing = *out; backing_size = size; allocations++; }
     return r;
 }
+static int stream_frees;   // the output stream test: its blocks are not the renderer's work buffer
 static void work_free(void *p) {
-    if (p) { assert(p == backing); backing = NULL; backing_size = 0; frees++; }
+    if (p && !stream_frees) { assert(p == backing); backing = NULL; backing_size = 0; frees++; }
     free(p);
 }
 #define posix_memalign work_alloc
@@ -89,12 +90,20 @@ void dm_guest_thread_join(void *tt) {
     joins++;
 }
 uint64_t now_ns(void) { return 0; }
+uint64_t hle_system_event_binding(void *g) { (void)g; return 0; }
+int hle_signal_system_event_binding(uint64_t binding) { (void)binding; return 0; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
-void *dm_pcmout_open(int ch) { (void)ch; return NULL; }
-void dm_pcmout_close(void *k) { (void)k; }
-void dm_pcmout_start(void *k) { (void)k; }
-int dm_pcmout_append(void *k, void *b) { (void)k; (void)b; return 0; }
-void *dm_pcmout_released(void *k) { (void)k; return NULL; }
+// A host output for the output stream test: records what is appended, and hands blocks back when the test says they played. Off (NULL), as for the renderer tests
+static int out_on, out_opened, out_closed, out_started, out_full; static void *out_q[64]; static unsigned out_w, out_r; static uint8_t out_bytes[1 << 16]; static size_t out_len;
+void *dm_pcmout_open(int ch) { (void)ch; if (!out_on) return NULL; out_opened++; return &out_on; }
+void dm_pcmout_close(void *k) { (void)k; out_closed++; }
+void dm_pcmout_start(void *k) { (void)k; out_started++; }
+int dm_pcmout_append(void *k, void *b) {
+    (void)k; if (!out_on || out_full) return 0;
+    const gbuf *g = b; memcpy(out_bytes + out_len, g->ptr, g->size); out_len += g->size; out_q[out_w++ % 64] = b; return 1;
+}
+static unsigned out_played;
+void *dm_pcmout_released(void *k) { (void)k; return out_r < out_played ? out_q[out_r++ % 64] : NULL; }
 void dm_pcmout_wait(void *k, int ms) { (void)k; (void)ms; }
 void hle_bind_system_event(void *ev, int ac) {
     assert(ev == sdk_event && ac == 1 && event_destroys == 2 * event_binds + 1);   // after the open destroys the SDK's local event (each earlier Close destroyed one more)
@@ -102,10 +111,53 @@ void hle_bind_system_event(void *ev, int ac) {
 }
 uint32_t hle_dup_readable_handle(uint32_t h) { assert(h == 0x1002); return 0x1003; }
 
+// An output stream: frames reach the output in blocks and in order, what has played makes the room, Stop lets the last part out, Close closes it; a format the output does not take stays silent
+static void t_output_stream(void) {
+    stream_frees = 1;
+    static int16_t in[2 * 4096]; for (int i = 0; i < 2 * 4096; i++) in[i] = (int16_t)(i * 7 + 1);
+    int32_t fmt[3] = {2, 2, 48000}; char type[64], name[8] = {0};
+    out_on = 1;
+    assert(h_os_Open(type, NULL, NULL, 0, name, fmt, 960, 480) == RES_OK && out_opened == 1);
+    assert(h_os_Free(type) == 960 && h_os_State(type) == 1);
+    assert(h_os_Write(type, in, 100) == 100 && out_len == 0);                  // part of a block waits
+    assert(h_os_Free(type) == 860);
+    assert(h_os_Write(type, in + 200, 300) == 300 && out_len == 240 * 4);      // one block out, 160 frames waiting
+    assert(!memcmp(out_bytes, in, 240 * 4));
+    assert(h_os_Start(type) == RES_OK && out_started == 1 && h_os_State(type) == 2);
+    assert(h_os_Start(type) == RES_OK && out_started == 1);                    // started once
+    assert(h_os_Free(type) == 560);
+    out_played = 1; assert(h_os_Free(type) == 800);                            // what played makes room
+    assert(h_os_Write(type, in + 800, 2000) == 800);                           // only what fits
+    assert(h_os_Free(type) == 0 && h_os_Write(type, in, 10) == 0);
+    assert(out_len == 1200 * 4 && !memcmp(out_bytes, in, 1200 * 4));           // in order, across the writes, whole blocks all out
+    out_played = 2; assert(h_os_Free(type) == 240);
+    assert(h_os_Write(type, in + 2400, 100) == 100 && out_len == 1200 * 4);    // part of a block waits
+    h_os_Stop(type); assert(h_os_State(type) == 1);
+    assert(out_len == 1300 * 4 && !memcmp(out_bytes, in, 1300 * 4));           // the last part goes out
+    h_os_Stop(type); assert(out_len == 1300 * 4);
+    out_full = 1; assert(h_os_Open(type, NULL, NULL, 0, name, fmt, 960, 480) == RES_OK && out_opened == 2 && out_closed == 1);   // opened again: the old output goes
+    size_t held = out_len;
+    assert(h_os_Write(type, in, 240) == 240 && out_len == held);               // a full output: the finished block waits, counted
+    assert(h_os_Write(type, in + 480, 10) == 0 && h_os_Free(type) == 720);     // nothing more until it goes
+    out_full = 0;
+    assert(h_os_Write(type, in + 480, 10) == 10 && out_len == held + 240 * 4 && !memcmp(out_bytes + held, in, 240 * 4));   // it goes first, nothing lost
+    h_os_Close(type); assert(out_closed == 2 && h_os_State(type) == 0 && atomic_load(&g_os_audible) == 0);
+    fmt[0] = 1; assert(h_os_Open(type, NULL, NULL, 0, name, fmt, 960, 480) == RES_OK && out_opened == 2);   // another format: silent
+    assert(h_os_Write(type, in, 100) == 100 && h_os_Free(type) == 860 && out_len == held + 240 * 4);
+    h_os_Close(type); assert(out_closed == 2);
+    fmt[0] = 2; char more[OS_AUDIBLE_MAX + 1][8];
+    for (int i = 0; i <= OS_AUDIBLE_MAX; i++) assert(h_os_Open(more[i], NULL, NULL, 0, name, fmt, 960, 480) == RES_OK);
+    assert(out_opened == 2 + OS_AUDIBLE_MAX);                                  // past the limit: silent, not a stop
+    for (int i = 0; i <= OS_AUDIBLE_MAX; i++) h_os_Close(more[i]);
+    assert(atomic_load(&g_os_audible) == 0);
+    out_on = 0; stream_frees = 0;
+}
+
 int main(void) {
     uint8_t param[P_SIZE] = {0}, saved[P_SIZE];
     const uint32_t words[] = {48000, 240, 132, 19, 138, 1, 16, 0, 0, 85, 1800, 0, 0, 0x38564552};
     memcpy(param, words, sizeof words);
+    t_output_stream();
     memcpy(saved, param, sizeof param);
     // Expected results were obtained by executing Horizon audio build 3a75b4a6's sizing routine,
     // independently of this implementation. A changed count must change the service requirement.

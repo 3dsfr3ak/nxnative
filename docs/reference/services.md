@@ -336,6 +336,22 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Open:** passive reading cannot obtain factory calibration without issuing SPI commands alongside the OS driver. Nominal scales are 4096 counts/G and 70 mdps/count ([protocol research](https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering/blob/master/imu_sensor_notes.md)); no automatic bias learning removes slow intentional turns. Sample order follows that research and [Linux hid-nintendo](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-nintendo.c); SDL reverses it. Confirm order, sensitivity, drift and reconnects on hardware before calling the reworked reader device-tested. `t_motion_pro`, `t_motion_pro_mac` and `t_hid` cover decoding, timestamps, ownership, removal, ambiguity and source fallback with synthetic inputs.
 - **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md), docked pointer on a Pro Controller.
 
+### SensorFusion and NpadImu (Switch 2 SDKs)
+
+- **Symptom:** a game using `nn::hid::SensorFusion` aborts on the hid service at `InitializeSensorFusion`; or, with a stand-in, its motion prompts never pass ("Point Joy-Con down"); or it aborts in `nerd::OnVerifyFailed` with `m_accelerometer_range > 0` when a sport starts (`game called nn::diag abort: Result 0`, backtrace through `nn::imu::FullSensorState::Initialize`).
+- **Cause:** SensorFusion is plain guest code in the `sdk` module, a filter (`nn::imu::FullSensorState`) fed from `GetNpadImuSamples`. Only `EnableNpadImu` and the calls around it reach the hid service, which the host does not serve; on Horizon the samples come through a ring in transfer memory. The filter takes the sensor's ranges from `GetSixAxisSensorIcInformation` and stops on a range of 0.
+- **Fix:** the library runs as it is, and the host takes over what is below it (`hle_hid.c`): `EnableNpadImu`, `DisableNpadImu`, `IsNpadImuEnabled`, `GetNpadImuSamples` (rings by player and device, fed from whichever motion source the six-axis sensor reads, 0x28-byte samples in m/s^2 and rad/s, 5 ms apart; a controller with no live motion lies flat and still), `GetSixAxisSensorIcInformation` (2000 dps at +0, 8 G at +0x64, the rest 0), calibration not kept (Load answers hid's 108) and no newly assigned device. So the orientation a game gets is the SDK's own. A handle is byte 0 the SDK's style index, byte 1 the npad id, byte 2 the device; `GetSensorFusionHandles` is the SDK's `utility::GetSixAxisSensorHandle`, not the host's six-axis handles.
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md) 1.1.0. The rest of the specifications is unknown and stays 0 (open).
+- **Check:** `t_hid` (`t_npad_imu`).
+
+### A lone right Joy-Con on the Mac
+
+- **Symptom:** a right Joy-Con paired over Bluetooth does nothing (`controller connected: Joy-Con (R) (no extended gamepad profile: not used)`).
+- **Cause:** GameController lists a lone Joy-Con with no extended gamepad profile, and front_mac.m reads only that profile. macOS lists it as two HID services, the device and `AppleGCHIDUserEventDriver` over it, neither marked synthetic, so a reader by product ID sees two controllers (players 1 and 2, and the game's controller applet saying 2 connected).
+- **Fix:** `joycon.h` (pure, the protocol and setup) and `joycon_mac.h` read it as raw HID, one pad per location ID: calibration from SPI flash, then the IMU and report 0x30 by output report 0x01, written with the device open nonexclusive. It then takes a player slot as a raw HID pad does, its buttons and stick in `pad_hid`. All three samples of a report reach the rings. Its motion plays the right half of a pair (`dm_motion_right_only`): the left half lies still. In the Switch frame, held as attached to a console: acceleration (-raw1, -raw0, raw2), rotation (raw4, raw3, -raw5).
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md). Not done: a left Joy-Con, a pair as one controller, SL and SR, Home and Capture, rumble.
+- **Check:** `t_joycon`; `t_hid` for the right half.
+
 ### SDK 20 six-axis sensor and amiibo (`nfp`) calls
 
 - **Symptom:** SDK 20 calls that reach a service; `nfp`'s `AttachActivateEvent` / `AttachDeactivateEvent` crashed in the SDK at `sdk+0x3f2a78`.

@@ -20,6 +20,8 @@ void mtl_alias_drop_pool(const void *pool);
 // physical memory pool Finalize: the shared placement sparse tiles of its memory go back once no texture maps them (sp_release)
 void mtl_sp_phys_gone(const void *mem, uint64_t size);
 void mtl_pool_gpu_written(const void *pool);   // the GPU writes this pool: its uncompressed textures are no longer taken from storage (tex_cpu_content)
+#define MTL_POOL_BIG_MIN (512ull << 20)   // pools from this size on are wrapped in chunks (nvn_mtl.m BIG_MIN)
+void mtl_pool_asked(const void *mem, uint64_t addr, uint64_t len);   // the game asked NVN an address in this pool (len 0: the pool's own): raw global memory reaches it
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off);   // 1 on success; buf is a (__bridge) id<MTLBuffer>
 
 typedef struct {

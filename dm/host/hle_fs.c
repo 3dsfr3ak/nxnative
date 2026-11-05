@@ -553,10 +553,11 @@ HLE_FORCE("_ZN2nn2fs17MountAddOnContentEPKciPvm", "fsp-srv; add-on content → D
 // builds Mii heads from it at boot, for the title screen's demo race): the host writes a stand-in with every part empty (hle_mii.c dm_mii_standin) into <DM_TEMP>_sysdata/<id> and mounts it
 // read-only. Any other archive answers "target not found", as for a title that is not installed
 #define SYSDATA_MIIMODEL 0x0100000000000802ull
+#define SYSDATA_MIIRESOURCE 0x0400000000000849ull   // the Switch 2 archive (Nintendo Switch Sports Resort): the same stand-in, with its Ounce textures
 int dm_mii_standin(const char *dir);
 static int sysdata_dir(char *dir, size_t n, uint64_t id) {
     char t[1024];
-    if (id != SYSDATA_MIIMODEL || snprintf(dir, n, "%s_sysdata/%016llx", envdir("DM_TEMP", "run/platform/temp", t, sizeof t), (unsigned long long)id) >= (int)n) return 0;
+    if ((id != SYSDATA_MIIMODEL && id != SYSDATA_MIIRESOURCE) || snprintf(dir, n, "%s_sysdata/%016llx", envdir("DM_TEMP", "run/platform/temp", t, sizeof t), (unsigned long long)id) >= (int)n) return 0;
     return dm_mii_standin(dir);
 }
 HLE_FORCE("_ZN2nn2fs29QueryMountSystemDataCacheSizeEPmNS_3ncm12SystemDataIdE", "fsp-srv; system data reads the host directory directly, the cache is the size of its RomFS file table", Result, h_fs_QuerySysDataCache, size_t *out, uint64_t id) {
@@ -598,6 +599,16 @@ HLE_FORCE("_ZN2nn2fs21GetUtf16PathLengthMaxEPbPmPKc", "fsp-srv; host mounts have
 }
 HLE_FORCE("_ZN2nn2fs26GetUtf16EntryNameLengthMaxEPbPmPKc", "fsp-srv; host mounts have no UTF-16 entry name limit", Result, h_fs_GetUtf16EntryNameLengthMax, uint8_t *limited, uint64_t *out, const char *path) {
     (void)path; *limited = 0; *out = 0x300; return RES_OK;
+}
+// RAM disk: an empty writable file system that lasts until the program ends. Nintendo Switch Sports Resort copies its VoiceText files into one (main+0x8c8028). The host mounts a host directory, new for each run; the guest's buffer stays unused
+HLE_FORCE("_ZN2nn2fs20GetRamDiskBufferSizeEm", "fsp-srv; the host keeps a RAM disk in a host directory: the smallest buffer", size_t, h_fs_RamDiskSize, size_t size) { (void)size; return 0x1000; }
+HLE_FORCE("_ZN2nn2fs12MountRamDiskEPKcPvm", "fsp-srv; RAM disk → a host directory of its own, new for each run", Result, h_fs_MountRamDisk, const char *name, void *buf, size_t sz) {
+    (void)buf; (void)sz; char t[1024], dir[1280], cmd[1400];
+    int n = snprintf(dir, sizeof dir, "%s_ramdisk/%s", envdir("DM_TEMP", "run/platform/temp", t, sizeof t), name);
+    if (n < 0 || n >= (int)sizeof dir) return RES_FAIL;
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", dir, dir);
+    if (system(cmd)) { LOG("[RED] fs::MountRamDisk(%s): cannot make %s", name, dir); return RES_FAIL; }
+    return mount(name, dir, 0);
 }
 HLE_FORCE("_ZN2nn2fs21MountTemporaryStorageEPKc", "fsp-srv; temporary storage → host directory", Result, h_fs_MountTemp, const char *name) {
     char b[1024]; return mount(name, envdir("DM_TEMP", "run/platform/temp", b, sizeof b), 0);
@@ -642,8 +653,10 @@ HLE_FORCE("_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", "fsp-srv; the save dir
 HLE_FORCE("_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", "fsp-srv; only this game's own save data exists", int, h_fs_SaveExisting, uint64_t app, const void *uid) {
     (void)uid; LOG("fs asks whether save data exists: program %016llx → %s", (unsigned long long)app, app == DM_GAME_PROGRAM_ID ? "this game, yes" : "another program, no"); return app == DM_GAME_PROGRAM_ID;
 }
-HLE_FORCE("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", "fsp-srv; another program's save data: none", Result, h_fs_MountSaveRO, const char *name, uint64_t app, const void *uid) {
-    (void)uid; LOG("[RED] fs read-only mount of another program's save data %s: program %016llx, the host has none", name, (unsigned long long)app); return 0x7d402u;   // fs ResultTargetNotFound
+HLE_FORCE("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", "fsp-srv; this game's own save read-only (Nintendo Switch Sports Resort); another program's: none", Result, h_fs_MountSaveRO, const char *name, uint64_t app, const void *uid) {
+    (void)uid; const char *own = getenv("DM_SAVE");
+    if (app == DM_GAME_PROGRAM_ID && own) { mkdir(own, 0755); return mount(name, own, 1); }
+    LOG("[RED] fs read-only mount of another program's save data %s: program %016llx, the host has none", name, (unsigned long long)app); return 0x7d402u;   // fs ResultTargetNotFound
 }
 HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv; save data → host directory (single user)", Result, h_fs_MountSave, const char *name, const void *uid) { dm_thread_service_request();
     (void)uid;

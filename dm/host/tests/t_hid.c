@@ -490,6 +490,53 @@ static void t_motion_hid(void) {
     dm_pad_players(1); g_phone_mode = -1;
 }
 
+// NpadImu, what the SDK's SensorFusion library reads: samples in order and in its units, a still controller without motion, one sample per source, a lone right Joy-Con as the right half of a pair
+static void t_npad_imu(void) {
+    g_mode = 1; dm_pad_players(1); ids((uint32_t[]){0, NPAD_HANDHELD}, 2); g_phone_mode = 0;
+    uint32_t left = 5, right = 5 | 1u << 16;   // the SDK's handles on No1 for dual Joy-Cons (utility::GetSixAxisSensorHandle): style index, npad id, device
+    NpadImuSample s[32]; float flat[3] = {0, 0, -1}, turn[3] = {0, 0, 2 * (float)M_PI}, tilted[3] = {.5f, 0, -.8660254f};
+    motion_now += 1000000000; dm_motion_clear(0); dm_motion_clear_hid(0);
+    CHECK(!h_hid_ImuIs() && h_hid_ImuSamples(s, 16, right) == 0, "NpadImu: no samples before it is enabled");
+    dm_motion_set_hid(0, flat, turn, motion_now);
+    CHECK(h_hid_ImuEnable(NULL, 0) == RES_OK && h_hid_ImuIs(), "NpadImu: enabled");
+    motion_now += MOTION_STALE_NS + 1;
+    CHECK(h_hid_ImuSamples(s, 16, right) == 1 && s[0].acc[0] == 0 && s[0].acc[2] == -IMU_G && s[0].gyro[2] == 0 && s[0].delta_ns == SIX_PERIOD_NS, "NpadImu: with no live motion the controller lies flat and still; what came before enabling is gone");
+    CHECK(h_hid_ImuSamples(s, 16, right) == 0, "NpadImu: no time passed, no new still sample");
+    CHECK(h_hid_ImuSamples(NULL, 16, right) == 0 && h_hid_ImuSamples(s, 0, right) == 0 && h_hid_ImuSamples(s, 16, right | 5u << 8) == 0, "NpadImu: nothing for no buffer, no room, no controller");
+    for (int i = 0; i < 3; i++) dm_motion_set_hid(0, flat, turn, motion_now - (2 - i) * 5000000);
+    CHECK(h_hid_ImuSamples(s, 2, right) == 2 && s[0].sampling + 1 == s[1].sampling, "NpadImu: oldest first, as many as asked");
+    CHECK(s[0].acc[2] == -IMU_G && fabsf(s[0].gyro[2] - 2 * (float)M_PI) < 1e-4f && s[0].delta_ns == SIX_PERIOD_NS, "NpadImu: m/s^2 and rad/s, 5 ms apart");
+    CHECK(h_hid_ImuSamples(s, 16, right) == 1, "NpadImu: the rest at the next read");
+    CHECK(h_hid_ImuSamples(s, 16, right) == 0, "NpadImu: a live controller with nothing new has no samples, not still ones");
+    CHECK(h_hid_ImuSamples(s, 16, left) == 3, "NpadImu: a whole controller moves both halves of a pair");
+    for (int i = 0; i < 40; i++) { motion_now += SIX_PERIOD_NS; dm_motion_set_hid(0, flat, turn, motion_now); }
+    CHECK(h_hid_ImuSamples(s, 32, right) == IMU_RING && s[IMU_RING - 1].sampling - s[0].sampling == IMU_RING - 1, "NpadImu: a reader far behind gets the newest ring's worth");
+    h_hid_ImuSamples(s, 32, left);
+    motion_now += 1000000; dm_motion_set(0, tilted, turn);
+    CHECK(h_hid_ImuSamples(s, 16, right) == 1 && fabsf(s[0].acc[0] - .5f * IMU_G) < 1e-4f, "NpadImu: GameController's motion counts");
+    dm_motion_set_hid(0, flat, turn, motion_now - 1000);
+    CHECK(h_hid_ImuSamples(s, 16, right) == 0, "NpadImu: raw HID for the same controller does not count the motion twice");
+    h_hid_ImuSamples(s, 16, left); dm_motion_clear(0); motion_now += MOTION_STALE_NS + 1;
+    // A lone right Joy-Con. The left half reads still samples, as the six-axis sensor does for it
+    h_hid_SetStyles(STYLE_HANDHELD | STYLE_JOYDUAL); dm_motion_right_only(0, 1);
+    dm_motion_set_hid(0, tilted, turn, motion_now);
+    CHECK(h_hid_ImuSamples(s, 16, right) == 1 && fabsf(s[0].acc[0] - .5f * IMU_G) < 1e-4f, "lone right Joy-Con: its motion is the right half's");
+    h_hid_ImuDisable(); h_hid_ImuEnable(NULL, 0);
+    dm_motion_set_hid(0, tilted, turn, motion_now + 0);
+    motion_now += 1000; dm_motion_set_hid(0, tilted, turn, motion_now);
+    CHECK(h_hid_ImuSamples(s, 16, left) == 1 && s[0].acc[0] == 0 && s[0].gyro[2] == 0, "lone right Joy-Con: the left half lies still");
+    SixAxisState st; uint32_t six_left = 2, six_right = 2 | 1u << 16;   // the host's six-axis handles: the style's bit number
+    h_hid_SixStates(&st, 1, &six_right); CHECK(st.acc[0] == .5f && st.gyro[2] > .99f && !h_hid_SixRest(&six_right), "lone right Joy-Con: six-axis, the right half moves");
+    h_hid_SixStates(&st, 1, &six_left); CHECK(st.acc[0] == 0 && st.acc[2] == -1 && st.gyro[2] == 0 && h_hid_SixRest(&six_left), "lone right Joy-Con: six-axis, the left half lies flat");
+    h_hid_SetStyles(0xffffffffu); h_hid_SixStates(&st, 1, &(uint32_t){0}); CHECK(st.acc[0] == .5f, "lone right Joy-Con as full-key: one sensor, its own");
+    dm_motion_right_only(0, 0); dm_motion_clear_hid(0); g_phone_mode = -1;
+    CHECK(h_hid_ImuDisable() == RES_OK && !h_hid_ImuIs() && h_hid_ImuSamples(s, 16, right) == 0, "NpadImu: no samples once disabled");
+    uint8_t ic[0xc8]; float ranges[2]; memset(ic, 0xaa, sizeof ic); CHECK(h_hid_SixIc(ic, &right) == RES_OK, "six-axis specifications");
+    memcpy(&ranges[0], ic, 4); memcpy(&ranges[1], ic + 0x64, 4);
+    CHECK(ranges[0] == 2000 && ranges[1] == 8 && ic[4] == 0 && ic[0xc7] == 0, "six-axis specifications: the ranges the SDK's filter needs above 0, the rest zero");
+    CHECK(h_hid_SixCalLoad(ic, &right) == 0xd8cau && h_hid_SixCalStore(&right, ic) == RES_OK && !h_hid_SixNew(&right), "six-axis calibration: not kept; no new device");
+}
+
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     t_slots();
@@ -500,6 +547,7 @@ int main(void) {
     t_motion_threads();
     t_motion_live();
     t_motion_hid();
+    t_npad_imu();
     t_rec();
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing
         int w = 0, h = 0; uint64_t std = 7; uint32_t npad = 9;

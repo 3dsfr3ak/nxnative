@@ -141,9 +141,10 @@ int dm_mii_standin(const char *dir) {   // written once per process (the query a
     char p[1024]; strlcpy(p, dir, sizeof p);
     for (char *s = p + 1; *s; s++) if (*s == '/') { *s = 0; mkdir(p, 0755); *s = '/'; }
     mkdir(p, 0755);
-    static const char *tex[] = {"NXTextureLowLinear.dat", "NXTextureLowSRGB.dat", "NXTextureMidLinear.dat", "NXTextureMidSRGB.dat"}, *shape[] = {"ShapeMid.dat", "ShapeHigh.dat"};
+    // The Switch 2 archive, system data 0400000000000849: the same files plus Ounce textures (Nintendo Switch Sports Resort reads it)
+    static const char *tex[] = {"NXTextureLowLinear.dat", "NXTextureLowSRGB.dat", "NXTextureMidLinear.dat", "NXTextureMidSRGB.dat", "OunceTextureLowLinear.dat", "OunceTextureLowSRGB.dat", "OunceTextureMidLinear.dat", "OunceTextureMidSRGB.dat", "OunceTextureHighLinear.dat", "OunceTextureHighSRGB.dat"}, *shape[] = {"ShapeMid.dat", "ShapeHigh.dat"};
     int ok = 1;
-    for (int i = 0; i < 4; i++) ok &= mii_write(dir, tex[i], 11, MII_TEX_SIZE);
+    for (size_t i = 0; i < sizeof tex / sizeof *tex; i++) ok &= mii_write(dir, tex[i], 11, MII_TEX_SIZE);
     for (int i = 0; i < 2; i++) ok &= mii_write(dir, shape[i], 12, MII_SHAPE_SIZE);
     LOG("mii: MiiModel system data is the host's stand-in (no textures, every shape one degenerate triangle: Mii heads draw nothing) in %s", dir);
     done = ok ? 1 : -1;

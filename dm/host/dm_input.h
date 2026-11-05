@@ -34,6 +34,8 @@ void dm_motion_clear(int player);   // clears GameController motion; another fre
 // Kept separate from GameController and the phone; used while GameController supplies no fresh motion for that player. DM_MOTION_AXES / ACC_SIGN apply only to GameController.
 void dm_motion_set_hid(int player, const float acc[3], const float rot[3], uint64_t sample_ns);
 void dm_motion_clear_hid(int player);
+// The player's controller is one right Joy-Con (joycon_mac.h): in a style of two Joy-Cons its motion is the right half's, and the left half lies still. Nonzero to set, 0 when it goes
+void dm_motion_right_only(int player, int on);
 uint32_t dm_player_npad(int player);  // the npad id the game reads player p + 1 on: Handheld (0x20) or No1 (0) for player 1, No n (id n - 1) for player n
 // A library applet in front of the game (the offline web page, hle_web.c / web_apple.m): while held, the game reads no buttons and centred sticks on every npad, as an application
 // out of focus does, and presses made meanwhile are dropped when the hold ends. dm_input_peek reads what the applet sees: every path ORed (any controller drives it), each stick

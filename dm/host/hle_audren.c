@@ -16,6 +16,7 @@
 #include "hle.h"
 #include <math.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -573,6 +574,128 @@ enum { DEVNAME = 0x100 };
 static void out_devname(char *out) { memset(out, 0, DEVNAME); strlcpy(out, "AudioBuiltInSpeakerOutput", DEVNAME); }
 HLE_FORCE("_ZN2nn5audio25ListAudioOutputDeviceNameEPNS0_15AudioDeviceNameEi", "output device list: 1 built-in speaker", int, h_ad_List, char *names, int n) { if (n <= 0 || !names) return 0; out_devname(names); return 1; }
 HLE_FORCE("_ZN2nn5audio30GetActiveAudioOutputDeviceNameEPNS0_15AudioDeviceNameE", "active output device: built-in speaker", void, h_ad_Active, char *name) { out_devname(name); }
+// Output streams and virtual output devices (SDK 22; Nintendo Switch Sports Resort plays its menu movie's sound through them). The SDK's calls open the auddmg:u service, which the host does not serve.
+// A stream is a host PCM output, as the audio renderer's (dm_pcmout_*): its frames go out in blocks, and the blocks handed back once played make the room the game sees, so the device paces the game.
+// A format the output does not take (anything but 16-bit at 48 kHz, one or two channels) or more streams than it has room for are silent, paced by the clock as a device would pace them
+#define OS_MAX 32
+enum { OS_FORMAT_PCM16 = 2, OS_AUDIBLE_MAX = 4, OS_BLOCK_MIN = 240, OS_BLOCKS_MAX = 16 };
+typedef struct { const void *type; uint64_t binding, written, start_ns, played0, next_ns, period_ns; int capacity, period, rate, started;
+                 void *out; uint8_t *data; int running, fsize, block, nfree; gbuf bufs[OS_BLOCKS_MAX], *free_list[OS_BLOCKS_MAX], *cur; } out_stream;
+static out_stream g_os[OS_MAX];
+static pthread_mutex_t g_os_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_os_audible;
+static uint64_t os_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+static out_stream *os_find(const void *type) { for (int i = 0; i < OS_MAX; i++) if (g_os[i].type == type) return &g_os[i]; return NULL; }
+static uint64_t os_played(out_stream *o) {   // frames played, never past what was written
+    if (o->out) {
+        gbuf *b;
+        while ((b = dm_pcmout_released(o->out))) { o->played0 += b->size / (uint64_t)o->fsize; o->free_list[o->nfree++] = b; }
+        return o->played0;
+    }
+    uint64_t p = o->played0;
+    if (o->started) p += (os_now() - o->start_ns) * (uint64_t)o->rate / 1000000000ull;
+    return p < o->written ? p : o->written;
+}
+static void *os_clock(void *arg) {   // the device's period: each started stream's event
+    (void)arg;
+    for (;;) {
+        usleep(2000);
+        uint64_t now = os_now();
+        pthread_mutex_lock(&g_os_mu);
+        for (int i = 0; i < OS_MAX; i++) if (g_os[i].type && g_os[i].started && g_os[i].binding && now >= g_os[i].next_ns) { hle_signal_system_event_binding(g_os[i].binding); g_os[i].next_ns = now + g_os[i].period_ns; }
+        pthread_mutex_unlock(&g_os_mu);
+    }
+    return NULL;
+}
+// Takes the stream's output off it; the caller closes that, outside the lock, as closing waits for the device
+static void *os_take_output(out_stream *o, uint8_t **data) { void *out = o->out; *data = o->data; o->out = NULL; o->data = NULL; o->cur = NULL; o->nfree = 0; o->running = 0; return out; }
+static void os_close_output(void *out, uint8_t *data) { if (out) { dm_pcmout_close(out); free(data); atomic_fetch_sub(&g_os_audible, 1); } }
+static Result os_open(void *type, void *ev, const int32_t *fmt, int frames, int period) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    void os_clock_start(void); pthread_once(&once, os_clock_start);
+    if (ev) hle_bind_system_event(ev, 1);
+    int capacity = frames > 0 ? frames : 1, rate = fmt[2] > 0 ? fmt[2] : 48000, ch = fmt[1];
+    int block = capacity / 8 > OS_BLOCK_MIN ? capacity / 8 : OS_BLOCK_MIN, blocks = capacity / block + 2, fsize = ch * 2;
+    void *out = NULL; uint8_t *data = NULL;
+    if (fmt[0] == OS_FORMAT_PCM16 && rate == 48000 && (ch == 1 || ch == 2)) {
+        if (atomic_fetch_add(&g_os_audible, 1) >= OS_AUDIBLE_MAX || !(data = malloc((size_t)blocks * (size_t)block * (size_t)fsize))) { atomic_fetch_sub(&g_os_audible, 1); free(data); data = NULL; }
+        else if (!(out = dm_pcmout_open(ch))) { free(data); data = NULL; atomic_fetch_sub(&g_os_audible, 1); }
+    }
+    pthread_mutex_lock(&g_os_mu);
+    out_stream *o = os_find(type); if (!o) o = os_find(NULL);
+    void *old = NULL; uint8_t *old_data = NULL;
+    if (o) {
+        old = os_take_output(o, &old_data);
+        memset(o, 0, sizeof *o); o->type = type; o->binding = ev ? hle_system_event_binding(ev) : 0; o->capacity = capacity; o->period = period > 0 ? period : capacity / 2 + 1; o->rate = rate; o->period_ns = (uint64_t)o->period * 1000000000ull / (uint64_t)rate;
+        o->out = out; o->data = data; o->fsize = fsize; o->block = block;
+        if (out) for (int i = 0; i < blocks; i++) { o->bufs[i] = (gbuf){data + (size_t)i * (size_t)block * (size_t)fsize, (uint64_t)block * (uint64_t)fsize, 0}; o->free_list[o->nfree++] = &o->bufs[i]; }
+    }
+    pthread_mutex_unlock(&g_os_mu);
+    os_close_output(old, old_data);
+    if (!o) { os_close_output(out, data); LOG("[RED] audio output stream: more than %d at once", OS_MAX); return RES_FAIL; }
+    LOG("audio output stream opened: format %d, %d channels, %d Hz, %d frames, period %d; %s", fmt[0], ch, rate, capacity, o->period, out ? "played" : "silent, paced by the clock (the host output takes 16-bit at 48 kHz, and a few streams at once)");
+    return RES_OK;
+}
+void os_clock_start(void) { pthread_t t; if (!pthread_create(&t, NULL, os_clock, NULL)) pthread_detach(t); }
+HLE_FORCE("_ZN2nn5audio29GetDefaultVirtualOutputDeviceEPNS0_15AudioDeviceNameE", "default virtual output device: built-in speaker", void, h_os_Default, char *name) { out_devname(name); }
+HLE_FORCE("_ZN2nn5audio32GetVirtualOutputDevicePropertiesEPNS0_23VirtualDevicePropertiesERKNS0_15AudioDeviceNameE", "virtual output device properties: left as they are (the one caller reads none)", Result, h_os_Props, void *out, const char *name) { (void)out; (void)name; return RES_OK; }
+HLE_FORCE("_ZN2nn5audio16OpenOutputStreamEPNS0_16OutputStreamTypeEPNS_2os11SystemEventEPvmRKNS0_15AudioDeviceNameERKNS0_12StreamFormatEii", "output stream: a host PCM output", Result, h_os_Open,
+          void *type, void *ev, void *buf, size_t size, const char *name, const int32_t *fmt, int frames, int period) { (void)buf; (void)size; (void)name; return os_open(type, ev, fmt, frames, period); }
+HLE_FORCE("_ZN2nn5audio16OpenOutputStreamEPNS0_16OutputStreamTypeEPNS_2os11SystemEventEPvmRKNS0_15AudioDeviceNameERKNS0_12StreamFormatEiiNS_4util10BitFlagSetILi32ENS0_16OutputStreamFlagEEE", "output stream with flags: a host PCM output", Result, h_os_OpenFlags,
+          void *type, void *ev, void *buf, size_t size, const char *name, const int32_t *fmt, int frames, int period) { (void)buf; (void)size; (void)name; return os_open(type, ev, fmt, frames, period); }
+HLE_FORCE("_ZN2nn5audio17StartOutputStreamEPNS0_16OutputStreamTypeE", "output stream: starts its output and its event", Result, h_os_Start, void *type) {
+    void *start = NULL;
+    pthread_mutex_lock(&g_os_mu); out_stream *o = os_find(type);
+    if (o && !o->started) { o->started = 1; o->start_ns = os_now(); o->next_ns = o->start_ns + o->period_ns; if (o->out && !o->running) { o->running = 1; start = o->out; } }
+    pthread_mutex_unlock(&g_os_mu);
+    if (start) dm_pcmout_start(start);
+    return RES_OK;
+}
+// What is left of a part-filled block goes out: the output plays silence after it. A silent stream keeps the frames its clock has counted
+HLE_FORCE("_ZN2nn5audio16StopOutputStreamEPNS0_16OutputStreamTypeE", "output stream: stops its event, its last frames still play", void, h_os_Stop, void *type) {
+    pthread_mutex_lock(&g_os_mu); out_stream *o = os_find(type);
+    if (o && o->started) {
+        if (o->out) { if (o->cur && o->cur->size && dm_pcmout_append(o->out, o->cur)) o->cur = NULL; }
+        else o->played0 = os_played(o);
+        o->started = 0;
+    }
+    pthread_mutex_unlock(&g_os_mu);
+}
+HLE_FORCE("_ZN2nn5audio17CloseOutputStreamEPNS0_16OutputStreamTypeE", "output stream: closed", void, h_os_Close, void *type) {
+    void *out = NULL; uint8_t *data = NULL;
+    pthread_mutex_lock(&g_os_mu); out_stream *o = os_find(type); if (o) { out = os_take_output(o, &data); memset(o, 0, sizeof *o); } pthread_mutex_unlock(&g_os_mu);
+    os_close_output(out, data);
+}
+HLE_FORCE("_ZN2nn5audio20GetOutputStreamStateEPKNS0_16OutputStreamTypeE", "output stream state: 0 closed, 1 stopped, 2 started (the game only tests for 0)", int, h_os_State, const void *type) {
+    pthread_mutex_lock(&g_os_mu); out_stream *o = os_find(type); int s = o ? 1 + o->started : 0; pthread_mutex_unlock(&g_os_mu); return s;
+}
+HLE_FORCE("_ZN2nn5audio29GetOutputStreamFreeFrameCountEPKNS0_16OutputStreamTypeE", "output stream: room what has played has made", int, h_os_Free, const void *type) {
+    pthread_mutex_lock(&g_os_mu); out_stream *o = os_find(type); int f = o ? o->capacity - (int)(o->written - os_played(o)) : 0; pthread_mutex_unlock(&g_os_mu); return f < 0 ? 0 : f;
+}
+// The frames that fit, by the blocks of the output; a part-filled block waits for the next write
+HLE_FORCE("_ZN2nn5audio17WriteOutputStreamEPNS0_16OutputStreamTypeEPKvi", "output stream: the frames that fit, to its output", int, h_os_Write, void *type, const void *data, int frames) {
+    pthread_mutex_lock(&g_os_mu); out_stream *o = os_find(type); int n = 0;
+    if (o && frames > 0) {
+        int f = o->capacity - (int)(o->written - os_played(o)); n = frames < f ? frames : f; if (n < 0) n = 0;
+        if (o->out) {
+            const uint8_t *src = data; int left = n, whole = o->block * o->fsize;
+            while (left > 0) {
+                if (!o->cur) { if (!o->nfree) break; o->cur = o->free_list[--o->nfree]; o->cur->size = 0; }
+                int room = (whole - (int)o->cur->size) / o->fsize, k = left < room ? left : room;
+                memcpy((uint8_t *)o->cur->ptr + o->cur->size, src, (size_t)k * (size_t)o->fsize);
+                o->cur->size += (uint64_t)k * (uint64_t)o->fsize; src += (size_t)k * (size_t)o->fsize; left -= k;
+                if ((int)o->cur->size == whole) { if (!dm_pcmout_append(o->out, o->cur)) break; o->cur = NULL; }
+            }
+            n -= left;
+        }
+        o->written += (uint64_t)n;
+    }
+    pthread_mutex_unlock(&g_os_mu); return n;
+}
+typedef struct { uint64_t v[4]; } out_stream_stats;   // only +0x18 is read (main+0x3ab3510): above 0 the game reports it; nothing is lost here
+HLE_FORCE("_ZN2nn5audio25GetOutputStreamStatisticsEPNS0_16OutputStreamTypeEb", "output stream statistics: nothing dropped", out_stream_stats, h_os_Stats, void *type, bool reset) { (void)type; (void)reset; out_stream_stats s = {{0}}; return s; }
+HLE_FORCE("_ZN2nn5audio36ReleaseAudioOutputDeviceNotificationEPNS_2os11SystemEventE", "output device notification: nothing to release", void, h_os_ReleaseNotify, void *ev) { (void)ev; }
+
 // The SDK 12 names (Engage): the same service, the same answers
 HLE_FORCE("_ZN2nn5audio19ListAudioDeviceNameEPNS0_15AudioDeviceNameEi", "output device list (SDK 12 name): 1 built-in speaker", int, h_ad_List12, char *names, int n) { return h_ad_List(names, n); }
 HLE_FORCE("_ZN2nn5audio24GetActiveAudioDeviceNameEPNS0_15AudioDeviceNameE", "active output device (SDK 12 name): built-in speaker", void, h_ad_Active12, char *name) { out_devname(name); }

@@ -237,4 +237,50 @@ else: shutil.copyfile(src, dst)
         self.assertNotIn('game files on the phone', result.stdout)
 
 
+class SizeTableMargin(unittest.TestCase):
+    def table(self):
+        t = bytearray(b'RESTBL' + struct.pack('<IIII', 1, 160, 2, 1))
+        t += struct.pack('<IIII', 0x11, 100, 0x22, 200) + b'a/b.bfres'.ljust(160, b'\0') + struct.pack('<I', 300)
+        return bytes(t)
+
+    def setUp(self):
+        try: from compression import zstd
+        except ImportError:
+            try: from backports import zstd
+            except ImportError: self.skipTest('no zstd module')
+        self.zstd = zstd
+        self.dir = tempfile.TemporaryDirectory(); self.addCleanup(self.dir.cleanup)
+        self.src = Path(self.dir.name) / 'src'; self.img = Path(self.dir.name) / 'RomFS.img'
+        (self.src / 'System/Resource').mkdir(parents=True)
+        (self.src / 'System/Resource/ResourceSizeTable.Product.110.X.rsizetable.zs').write_bytes(zstd.compress(self.table()))
+        (self.src / 'other.bin').write_bytes(b'unchanged')
+
+    def read(self, rel):
+        _, off, size = image.read_index(self.img)[rel]
+        with open(self.img, 'rb') as f: f.seek(off); return f.read(size)
+
+    def test_every_entry_grows_and_nothing_else_changes(self):
+        image.pack(self.src, self.img, size_table_margin=0x100)
+        t = self.zstd.decompress(self.read('System/Resource/ResourceSizeTable.Product.110.X.rsizetable.zs'))
+        self.assertEqual(struct.unpack_from('<IIII', t, 22), (0x11, 100 + 0x100, 0x22, 200 + 0x100))
+        self.assertEqual(struct.unpack_from('<I', t, 38 + 160)[0], 300 + 0x100)
+        self.assertEqual(t[38:38 + 9], b'a/b.bfres')
+        self.assertEqual(self.read('other.bin'), b'unchanged')
+
+    def test_no_margin_keeps_the_table(self):
+        image.pack(self.src, self.img)
+        self.assertEqual(self.zstd.decompress(self.read('System/Resource/ResourceSizeTable.Product.110.X.rsizetable.zs')), self.table())
+
+    def test_a_changed_margin_is_not_reused(self):
+        image.pack(self.src, self.img, reuse=True, size_table_margin=0x100)
+        image.pack(self.src, self.img, reuse=True, size_table_margin=0x200)
+        t = self.zstd.decompress(self.read('System/Resource/ResourceSizeTable.Product.110.X.rsizetable.zs'))
+        self.assertEqual(struct.unpack_from('<I', t, 26)[0], 100 + 0x200)
+
+    def test_a_margin_without_a_table_stops(self):
+        (self.src / 'System/Resource/ResourceSizeTable.Product.110.X.rsizetable.zs').unlink()
+        with self.assertRaises(RuntimeError): image.pack(self.src, self.img, size_table_margin=0x100)
+        self.assertFalse(Path(str(self.img) + '.part').exists())
+
+
 if __name__ == '__main__': unittest.main()

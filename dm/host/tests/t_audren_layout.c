@@ -14,6 +14,8 @@ void *objmap_del(const void *key) { (void)key; return NULL; }
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack) { (void)fn; (void)arg; (void)prio; (void)stack; return NULL; }
 void dm_guest_thread_join(void *tt) { (void)tt; }
 uint64_t now_ns(void) { return 0; }
+uint64_t hle_system_event_binding(void *g) { (void)g; return 0; }
+int hle_signal_system_event_binding(uint64_t binding) { (void)binding; return 0; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
 void *dm_pcmout_open(int ch) { (void)ch; return NULL; }
 void dm_pcmout_close(void *k) { (void)k; }

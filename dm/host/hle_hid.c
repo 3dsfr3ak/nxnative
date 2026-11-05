@@ -296,7 +296,13 @@ static int player_of(uint32_t id) {   // the reported player on npad id; -1 when
     if (id == connected_id()) return 0;
     return id > 0 && id < DM_PLAYERS && reported((int)id) ? (int)id : -1;
 }
-static uint32_t style_for_player(uint32_t id, int p) { return p < 0 ? 0 : id == NPAD_HANDHELD ? STYLE_HANDHELD : STYLE_FULLKEY; }
+static uint32_t g_styles_supported = 0xffffffffu;
+// The style a player's controller reports: handheld on that npad; otherwise full-key, or dual Joy-Con for a game that takes those and not full-key (Nintendo Switch Sports Resort's sports, styles 0x6: reported as full-key, it opened the controller applet again and again)
+static uint32_t style_for_player(uint32_t id, int p) {
+    if (p < 0) return 0;
+    if (id == NPAD_HANDHELD) return STYLE_HANDHELD;
+    return !(g_styles_supported & STYLE_FULLKEY) && (g_styles_supported & STYLE_JOYDUAL) ? STYLE_JOYDUAL : STYLE_FULLKEY;
+}
 static uint32_t style_of(uint32_t id) { return style_for_player(id, player_of(id)); }
 static int32_t ax(uint64_t v, int i) { return (int16_t)(v >> (16 * i)); }
 static int32_t pick(int32_t a, int32_t b) { return (a < 0 ? -a : a) >= (b < 0 ? -b : b) ? a : b; }   // whichever of two sources is deflected more
@@ -511,9 +517,11 @@ HLE_FORCE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", "supported controller ids; 
     for (int p = 1; p < DM_PLAYERS; p++) if ((uint32_t)reported(p) != (was >> p & 1)) style_changed((uint32_t)p);
     note_merged();
 }
-static uint32_t g_styles_supported = 0xffffffffu;
 HLE_FORCE("_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "supported controller styles; the host records them and picks the reported style from them", void, h_hid_SetStyles, uint32_t styles) {
-    if (styles != g_styles_supported) LOG("hid supported controller styles %#x", styles); g_styles_supported = styles; }
+    if (styles == g_styles_supported) return;
+    LOG("hid supported controller styles %#x", styles);
+    uint32_t was = style_for_player(NPAD_NO1, 0); g_styles_supported = styles;
+    if (style_for_player(NPAD_NO1, 0) != was) { LOG("hid: controllers now report style %#x", style_for_player(NPAD_NO1, 0)); for (int p = 0; p < DM_PLAYERS; p++) style_changed((uint32_t)p); } }
 HLE_FORCE("_ZN2nn3hid15GetNpadStyleSetERKj", "controller style query; follows DM_OPMODE", uint32_t, h_hid_GetStyle, const uint32_t *id) { return style_of(*id); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", "full-key controller states", int, h_hid_StatesFullKey, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_FULLKEY); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", "handheld controller states", int, h_hid_StatesHandheld, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_HANDHELD); }
@@ -564,6 +572,23 @@ static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < ato
 // Every history entry is the newest sample, numbered by time. DM_MOTION=0 ignores live motion; DM_MOTION_AXES / DM_MOTION_ACC_SIGN map Apple's axes (motion_fusion.h);
 // DM_MOTION_GAIN sets the tilt correction (default 0.5); DM_MOTION_LOG=1 logs player 1's mapped sample once a second, for checking the axes
 enum { MOTION_STALE_NS = 300000000 };
+// The samples NpadImu reads (h_hid_ImuSamples): as they arrive, by player and device, acceleration in m/s^2 with gravity down, rotation in rad/s, in the frame of motion_fusion.h.
+typedef struct { int64_t sampling, delta_ns; float acc[3], gyro[3]; } NpadImuSample;
+_Static_assert(sizeof(NpadImuSample) == 0x28, "NpadImuSample");
+enum { IMU_RING = 16 };
+#define IMU_G 9.80665f
+typedef struct { NpadImuSample s[IMU_RING]; uint64_t wr, rd, still_ns; int64_t seq; } imu_ring;
+static imu_ring g_imu[DM_PLAYERS][2];
+static pthread_mutex_t g_imu_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_imu_on;
+// A lone right Joy-Con plays the right half of a pair: its sensor moves, and the left half's lies still (dm_motion_right_only)
+static _Atomic int g_motion_right[DM_PLAYERS];
+void dm_motion_right_only(int p, int on) { if (p >= 0 && p < DM_PLAYERS) atomic_store(&g_motion_right[p], on); }
+static int motion_right_only(int p) {
+    uint32_t src = p ? 1u << p : 1u | merged_players();
+    for (int i = 0; i < DM_PLAYERS; i++) if (src >> i & 1 && atomic_load(&g_motion_right[i])) return 1;
+    return 0;
+}
 typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, received_ns, logged; } live_motion;
 static live_motion g_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
 static live_motion g_hid_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
@@ -577,6 +602,29 @@ static void motion_env(void) {
     if ((e = getenv("DM_MOTION_GAIN"))) g_motion_gain = (float)atof(e);
     g_motion_log = (e = getenv("DM_MOTION_LOG")) && atoi(e);
     e = getenv("DM_PHONE_MOTION"); g_phone_mode = !e || !strcmp(e, "auto") ? -1 : !!atoi(e);
+}
+static uint64_t motion_copy(live_motion *m, motion_state *out);
+// Whether this source is the one motion_live reads for the player, or a controller reporting through two would count each sample twice
+static int imu_source_wins(int p, int source) {
+    motion_state st;
+    if (source == 0) return 1;
+    if (source == 2) return !motion_copy(&g_motion[p], &st);
+    if (g_phone_mode > 0) return 1;
+    if (g_phone_mode == 0) return 0;
+    uint32_t src = 1u | merged_players();
+    for (int i = 0; i < DM_PLAYERS; i++) if (src >> i & 1 && (motion_copy(&g_motion[i], &st) || motion_copy(&g_hid_motion[i], &st))) return 0;
+    return 1;
+}
+static void imu_push(int p, const motion_state *st) {
+    if (!atomic_load(&g_imu_on)) return;
+    pthread_mutex_lock(&g_imu_mu);
+    for (int d = atomic_load(&g_motion_right[p]) ? 1 : 0; d < 2; d++) {
+        imu_ring *r = &g_imu[p][d]; NpadImuSample *s = &r->s[r->wr++ % IMU_RING];
+        s->sampling = ++r->seq; s->delta_ns = SIX_PERIOD_NS;
+        for (int i = 0; i < 3; i++) { s->acc[i] = st->acc[i] * IMU_G; s->gyro[i] = st->gyro[i] * 2 * (float)M_PI; }
+        if (r->wr - r->rd > IMU_RING) r->rd = r->wr - IMU_RING;   // a reader this far behind keeps the newest, as the console's ring holds
+    }
+    pthread_mutex_unlock(&g_imu_mu);
 }
 static void motion_set(int p, const float acc[3], const float rot[3], int source, uint64_t sample_ns) {
     if (p < 0 || p >= DM_PLAYERS || (source == 1 && p)) return;
@@ -597,7 +645,9 @@ static void motion_set(int p, const float acc[3], const float rot[3], int source
             source == 1 ? "phone" : source == 2 ? "controller HID" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
     }
     m->last_ns = t; m->received_ns = now;
+    motion_state snap = m->st;
     pthread_mutex_unlock(&m->mu);
+    if (imu_source_wins(p, source)) imu_push(p, &snap);
 }
 void dm_motion_set(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 0, 0); }
 void dm_motion_set_switch(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 1, 0); }
@@ -658,16 +708,25 @@ static void six_sample(SixAxisState *s, int64_t samp, int shakes) {
 // two sensors, the others one. A handle reads as connected while its controller is connected in that style; otherwise its entries are zero (not connected) and the count 0.
 // Only player 1's controller shakes (DM_BTN_SHAKE comes from the keyboard, the iPhone and DM_KEYS, all player 1)
 static int six_connected(uint32_t h) { return (h & 0xff) < 32 && (style_of(h >> 8 & 0xff) >> (h & 0xff) & 1); }
+// Live motion for this sensor: not for the left half of a pair played by a lone right Joy-Con
+static int six_live(uint32_t h, int pl, motion_state *ms) {
+    if (!motion_live(pl, ms)) return 0;
+    return !((h >> 16 & 0xff) == 0 && style_of(h >> 8 & 0xff) & (STYLE_HANDHELD | STYLE_JOYDUAL) && motion_right_only(pl));
+}
 static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (n <= 0) return 0;
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
     int64_t samp = (int64_t)(guest_ns() / SIX_PERIOD_NS);
     int pl = player_of(h >> 8 & 0xff), shakes = pl == 0;
     motion_state ms;
-    if (motion_live(pl, &ms)) { for (int i = 0; i < n; i++) six_sample_live(&out[i], samp - i, &ms, shakes); return n; }
+    if (six_live(h, pl, &ms)) { for (int i = 0; i < n; i++) six_sample_live(&out[i], samp - i, &ms, shakes); return n; }
     for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, shakes);
     return n;
 }
+// The console's protection against an accidental Home press (Nintendo Switch Sports Resort reads it every frame, main+0x3f9468): on by default; the host has no Home button of the guest's to protect
+static _Atomic int g_home_protect_off;
+HLE_FORCE("_ZN2nn3hid44IsUnintendedHomeButtonInputProtectionEnabledERKj", "Home button protection: on unless the game turned it off", bool, h_hid_HomeProtectIs, const uint32_t *id) { (void)id; return !g_home_protect_off; }
+HLE_FORCE("_ZN2nn3hid41EnableUnintendedHomeButtonInputProtectionERKjb", "Home button protection: the host only records it", void, h_hid_HomeProtectSet, const uint32_t *id, bool on) { (void)id; g_home_protect_off = !on; }
 HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for handheld / dual Joy-Cons, one otherwise",
           int, h_hid_SixHandles, uint32_t *h, int n, const uint32_t *id, uint32_t style) {
     int k = style & (STYLE_HANDHELD | STYLE_JOYDUAL) ? 2 : 1; if (k > n) k = n;
@@ -691,6 +750,7 @@ HLE_FORCE("_ZN2nn3hid12FinalizeJcmsEv", "Joy-Con mouse sensor: nothing to releas
 HLE_FORCE("_ZN2nn3hid13GetJcmsHandleERKjRKNS0_8JcmsTypeE", "Joy-Con mouse sensor handle: npad id | type << 8, as the SDK makes it",
           uint32_t, h_hid_JcmsHandle, const uint32_t *id, const uint32_t *type) { return (*id & 0xff) | (*type & 0xff) << 8; }
 HLE_FORCE("_ZN2nn3hid9StartJcmsERKNS0_10JcmsHandleE", "Joy-Con mouse sensor: no sensor on the host", void, h_hid_JcmsStart, const uint32_t *h) { (void)h; }
+HLE_FORCE("_ZN2nn3hid12GetJcmsStateEPNS0_9JcmsStateERKNS0_10JcmsHandleE", "Joy-Con mouse sensor state: all zero, as the SDK answers with no samples (Nintendo Switch Sports Resort)", void, h_hid_JcmsState, void *out, const uint32_t *h) { (void)h; memset(out, 0, 32); }
 HLE_FORCE("_ZN2nn3hid8StopJcmsERKNS0_10JcmsHandleE", "Joy-Con mouse sensor: no sensor on the host", void, h_hid_JcmsStop, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid13GetJcmsStatesEPNS0_9JcmsStateEiRKNS0_10JcmsHandleE", "Joy-Con mouse sensor states: none (no sensor on the host)",
           int, h_hid_JcmsStates, void *out, int n, const uint32_t *h) { (void)out; (void)n; (void)h; return 0; }
@@ -832,6 +892,10 @@ HLE_FORCE("_ZN2nn3hid19GetPlayerLedPatternERKj", "player LED: the Switch's patte
 }
 // NpadControllerColor = { main RGBA, button RGBA }: grey body, black buttons
 static void ctrl_color(uint32_t *c) { c[0] = 0xff828282u; c[1] = 0xff0f0f0fu; }
+// The Joy-Con icon colours (SDK 22; Nintendo Switch Sports Resort reads bytes 0-10 for its controller icons, main+0x3a4dbc): the host's grey body and black buttons, as GetNpadControllerColor. The layout past the first two colours is not known: the rest stays grey
+static void joyicon_color(uint8_t *c) { memset(c, 0x82, 12); c[3] = 0xff; memset(c + 4, 0x0f, 3); c[7] = 0xff; }
+HLE_FORCE("_ZN2nn3hid29GetNpadJoyIconDecorationColorEPNS0_26NpadJoyIconDecorationColorERKj", "Joy-Con icon colour", void, h_hid_JoyIcon, uint8_t *c, const uint32_t *id) { (void)id; joyicon_color(c); }
+HLE_FORCE("_ZN2nn3hid29GetNpadJoyIconDecorationColorEPNS0_26NpadJoyIconDecorationColorES2_RKj", "left and right Joy-Con icon colours", void, h_hid_JoyIcon2, uint8_t *l, uint8_t *r, const uint32_t *id) { (void)id; joyicon_color(l); joyicon_color(r); }
 HLE_FORCE("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorERKj", "controller color", Result, h_hid_Color, uint32_t *c, const uint32_t *id) { (void)id; ctrl_color(c); return RES_OK; }
 HLE_FORCE("_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorES2_RKj", "left and right Joy-Con colors", Result, h_hid_Color2, uint32_t *l, uint32_t *r, const uint32_t *id) { (void)id; ctrl_color(l); ctrl_color(r); return RES_OK; }
 HLE_FORCE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", "controller applet (no result wanted); the host answers as the overload above", Result, h_hid_ShowCtrl0, const int8_t *arg) { DM_APPLET("controller support"); return ctrl_support(NULL, arg); }
@@ -868,7 +932,7 @@ HLE_FORCE("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axi
 HLE_FORCE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", "six-axis sensor current state", void, h_hid_SixState, SixAxisState *s, const uint32_t *h) { six_states(s, 1, *h); }
 HLE_FORCE("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", "six-axis sensor at rest: yes unless player 1's is shaking or a live controller is turning", unsigned, h_hid_SixRest, const uint32_t *h) {
     int pl = player_of(*h >> 8 & 0xff); motion_state ms;
-    if (motion_live(pl, &ms)) return fabsf(ms.gyro[0]) + fabsf(ms.gyro[1]) + fabsf(ms.gyro[2]) < 0.01f && !(pl == 0 && shaking(guest_ns()));
+    if (six_live(*h, pl, &ms)) return fabsf(ms.gyro[0]) + fabsf(ms.gyro[1]) + fabsf(ms.gyro[2]) < 0.01f && !(pl == 0 && shaking(guest_ns()));
     return pl != 0 || !shaking(guest_ns());
 }
 // The console's own six-axis sensor (SevenSixAxisSensor, the body's orientation in handheld mode; The Legend of Zelda: Breath of the Wild): takes a work buffer and is switched through the hid service. The host provides none: switching succeeds, 0 states
@@ -888,6 +952,47 @@ HLE_FORCE("_ZN2nn3hid17GetDebugPadStatesEPNS0_13DebugPadStateEi", "debug pad sta
     for (int i = 0; i < n; i++) { memset(s + 32 * i, 0, 32); *(int64_t *)(s + 32 * i) = top - i; }
     return n > 0 ? n : 0;
 }
+// NpadImu (Switch 2 SDKs): what the SDK's SensorFusion library reads. That library is plain guest code on nn::imu::FullSensorState (Nintendo Switch Sports Resort: sdk UpdateSensorFusion feeds it
+// GetNpadImuSamples; GetSensorFusionHandles is utility::GetSixAxisSensorHandle), so the orientation a game gets is the SDK's own, from the controller's samples. On Horizon EnableNpadImu gives the hid
+// service a ring in transfer memory; the host has no such service and its samples are in g_imu (imu_push). A handle is byte 0 the style index, byte 1 the npad id, byte 2 the device (0 left, 1 right)
+HLE_FORCE("_ZN2nn3hid13EnableNpadImuEPvm", "NpadImu: no hid service; the host keeps the samples itself", Result, h_hid_ImuEnable, void *mem, size_t size) {
+    (void)mem; (void)size;
+    pthread_mutex_lock(&g_imu_mu); memset(g_imu, 0, sizeof g_imu); pthread_mutex_unlock(&g_imu_mu);
+    atomic_store(&g_imu_on, 1);
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn3hid14DisableNpadImuEv", "NpadImu: no hid service", Result, h_hid_ImuDisable, void) { atomic_store(&g_imu_on, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn3hid16IsNpadImuEnabledEv", "NpadImu: as enabled", bool, h_hid_ImuIs, void) { return atomic_load(&g_imu_on); }
+// New samples, oldest first; none yet is 0. A controller with no live motion lies flat and still, on the guest clock at the sensor's 200 Hz, as the six-axis sensor reports it (six_sample)
+HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHandleE", "NpadImu samples: the controller's, from the host's rings", int, h_hid_ImuSamples, NpadImuSample *out, int n, uint32_t h) {
+    uint32_t id = h >> 8 & 0xff; int dev = (h >> 16 & 0xff) == 1, pl = player_of(id), got = 0;
+    if (!out || n <= 0 || !atomic_load(&g_imu_on) || pl < 0 || !style_of(id)) return 0;
+    uint32_t src = pl ? 1u << pl : 1u | merged_players();
+    pthread_mutex_lock(&g_imu_mu);
+    for (int i = 0; i < DM_PLAYERS; i++) if (src >> i & 1) { imu_ring *r = &g_imu[i][dev]; while (got < n && r->rd != r->wr) out[got++] = r->s[r->rd++ % IMU_RING]; }
+    pthread_mutex_unlock(&g_imu_mu);
+    motion_state ms;
+    if (got || (motion_live(pl, &ms) && (dev || !motion_right_only(pl)))) return got;
+    pthread_mutex_lock(&g_imu_mu);
+    imu_ring *r = &g_imu[pl][dev]; uint64_t now = guest_ns(), due = r->still_ns ? (now - r->still_ns) / SIX_PERIOD_NS : 1;
+    if (due > IMU_RING) { due = 1; r->still_ns = 0; }
+    for (; got < n && (uint64_t)got < due; got++) out[got] = (NpadImuSample){++r->seq, SIX_PERIOD_NS, {0, 0, -IMU_G}, {0, 0, 0}};
+    if (got) r->still_ns = r->still_ns ? r->still_ns + (uint64_t)got * SIX_PERIOD_NS : now;
+    pthread_mutex_unlock(&g_imu_mu);
+    return got;
+}
+// What the library asks of the sensor beyond its samples. The chip's specifications (0xc8 bytes): the ranges at +0 and +0x64 are what the controllers run at (+-2000 dps, +-8 G: joycon.h asks for them);
+// Nintendo Switch Sports Resort's filter stops on a range of 0 (nerd::GyroPointingStateDetector, "m_accelerometer_range > 0"). The rest, per-unit tolerances, stays 0, values unknown (open).
+// Its learned gyro bias (0x744 bytes): not kept, so Load answers hid's "no calibration" (108) and the filter learns it again
+HLE_FORCE("_ZN2nn3hid29GetSixAxisSensorIcInformationEPNS0_26SixAxisSensorIcInformationERKNS0_19SixAxisSensorHandleE", "six-axis sensor specifications: the controllers' ranges", Result, h_hid_SixIc, void *out, const uint32_t *h) {
+    (void)h; memset(out, 0, 0xc8);
+    const float dps = 2000, g = 8; memcpy(out, &dps, 4); memcpy((uint8_t *)out + 0x64, &g, 4);
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn3hid37LoadSixAxisSensorCalibrationParameterEPNS0_33SixAxisSensorCalibrationParameterERKNS0_19SixAxisSensorHandleE", "six-axis calibration: none kept", Result, h_hid_SixCalLoad, void *out, const uint32_t *h) { (void)out; (void)h; return 0xd8cau; }
+HLE_FORCE("_ZN2nn3hid38StoreSixAxisSensorCalibrationParameterERKNS0_19SixAxisSensorHandleERKNS0_33SixAxisSensorCalibrationParameterE", "six-axis calibration: not kept", Result, h_hid_SixCalStore, const uint32_t *h, const void *in) { (void)h; (void)in; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid34IsSixAxisSensorDeviceNewlyAssignedERKNS0_19SixAxisSensorHandleE", "six-axis sensor: no new device to report", bool, h_hid_SixNew, const uint32_t *h) { (void)h; return false; }
+HLE_FORCE("_ZN2nn3hid39ResetIsSixAxisSensorDeviceNewlyAssignedERKNS0_19SixAxisSensorHandleE", "six-axis sensor: no new device to report", void, h_hid_SixNewReset, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid25EnableSixAxisSensorFusionERKNS0_19SixAxisSensorHandleEb", "six-axis sensor fusion; ignored by the host", void, h_hid_SixFusionOn, const uint32_t *h, uint32_t on) { (void)h; (void)on; }
 HLE_FORCE("_ZN2nn3hid28IsSixAxisSensorFusionEnabledERKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion: off", unsigned, h_hid_SixFusionQ, const uint32_t *h) { (void)h; return 0; }
 HLE_FORCE("_ZN2nn3hid25GetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleE", "gyroscope zero-drift mode: standard", int, h_hid_GyroGet, const uint32_t *h) { (void)h; return 1; }

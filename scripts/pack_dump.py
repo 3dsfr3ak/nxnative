@@ -18,6 +18,8 @@ import argparse, filecmp, shutil, struct, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'dm/tools'))
 import romfs_image
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'dm/games'))
+import game
 
 
 class Error(Exception): pass
@@ -44,10 +46,15 @@ def exefs(src, dst):
     shutil.rmtree(dst, ignore_errors=True); tmp.rename(dst)
 
 
-def pack(src, img, say=print):
+def size_table_margin(app):   # the profile's rsizetable_margin (romfs_image.widen_size_table: a workaround), 0 for a game with no such key or no profile
+    g = game.by_title(app)
+    return int(g.get('rsizetable_margin', '0'), 0) if g else 0
+
+
+def pack(src, img, say=print, margin=0):
     img.parent.mkdir(parents=True, exist_ok=True)
-    say(f'packing {src} → {img}')
-    try: n = romfs_image.pack(src, img, reuse=True)
+    say(f'packing {src} → {img}' + (f' (size table margin {margin:#x}: a workaround of the profile)' if margin else ''))
+    try: n = romfs_image.pack(src, img, reuse=True, size_table_margin=margin)
     except RuntimeError as e: raise Error(f'{src}: {e}') from e   # the files changed while packing
     say(f'  {n:,} entries, {img.stat().st_size / 2**30:.2f} GB')
 
@@ -77,7 +84,7 @@ def pack_version(src, app, out, say=print):   # one version's folder (base/ or u
     if not (src / 'exefs/main').is_file() or not (src / 'exefs/main.npdm').is_file() or not (src / 'romfs').is_dir(): raise Error(f'{src}: no exefs/main, exefs/main.npdm and romfs')
     if (pid := program_id(src / 'exefs/main.npdm')) != app: raise Error(f'{src}: program ID {pid:016X}, the base is {app:016X}')
     exefs(src / 'exefs', out / 'ExeFS')
-    pack(src / 'romfs', out / 'RomFS.img', say)
+    pack(src / 'romfs', out / 'RomFS.img', say, size_table_margin(app))
 
 
 def pack_dlc(app, dlc, aoc, say=print):   # {DLC title ID: its RomFS folder} → aoc/<index>.img; images of DLC no longer in the folder go
