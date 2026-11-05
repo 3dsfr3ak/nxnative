@@ -23,5 +23,10 @@ app_pool	0x240000000
 sys_resource	0x2000000
 shader_groups	/Shader/=shader /Effect/=effect /Layout/=layout
 shader_note	Nintendo Switch Sports Resort shaders
+# Golf in Handheld: the game's upscaler takes about 4.7 ms a frame, MetalFX about 0.9 ms, about 41 fps against 48 (README.md, Performance)
+upscaler	metalfx
+# Dynamic resolution reads the GPU time between the frame's timestamp reports. With one time per submission it reads about 0 and the game stays at its largest size, well below 60 fps;
+# with each report on its segment's GPU start / end, in Handheld with MetalFX, it goes down to mostly 640x360 at about 44 to 60 fps, mostly 52 to 60 (README.md, Performance)
+gpu_timestamps	segment
 # Not checked on this game yet: the sead / agl engine of Mario Kart World and Splatoon Raiders wraps its clears in render conditions
 render_cond	on

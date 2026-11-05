@@ -38,5 +38,10 @@ class UpscalerSetting(unittest.TestCase):
                 up=[s for s in settings.build(gid,tmp,'unused')['settings'] if s['env']=='DM_UPSCALER']
                 self.assertEqual(bool(up),shown,gid)
                 if up:self.assertEqual((up[0]['default'],up[0]['options']),('game',[['game',"Game's own"],['metalfx','MetalFX']]))
+    def test_a_profile_can_default_to_metalfx(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(settings.nacp,'languages',return_value=['en-US']):
+            (Path(tmp)/'main.fixups.tsv').write_text('')
+            up=[s for s in settings.build('04008E001F098000',tmp,'unused')['settings'] if s['env']=='DM_UPSCALER']   # Nintendo Switch Sports Resort: upscaler metalfx
+            self.assertEqual(up[0]['default'] if up else None,'metalfx')
 
 if __name__=='__main__':unittest.main()
