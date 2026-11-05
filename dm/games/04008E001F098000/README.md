@@ -35,6 +35,16 @@ What it was: with 11.5 GB of GPU memory in a tennis match, the GPU ran out of me
 
 Measured with those, 3.5 minutes in through a tennis match: GPU allocated 5.6 GB, peak wired 7.9 GB, no GPU errors. The GPU out-of-memory errors of changing sports are gone, and golf loads.
 
+## Performance
+
+Open. Golf on a 16 GB M2 MacBook Air, at the game's present interval 2 (33.3 ms a frame): about 27 fps at its usual 28 to 35 ms of GPU span, up to 35 fps in cheaper stretches (one run, `DM_NVN_GPUPROF=every:300`). It points to the GPU, not the CPU: the whole process uses 0.7 cores (Time Profiler). `sample` pauses the process and showed the Presentation Thread at 93%, where Time Profiler has it at 27%.
+
+- **The main shading pass is the largest cost:** 2048x1152, two colours and depth, 4 to 7 ms at about 80 to 120 draws and 12 to 14 ms at about 220, up to 40% of the GPU's busy time. Overdraw is not the cause: a depth pre-pass draws the same geometry first in 0.7 ms with 48-line shaders, and this pass tests depth without writing it, with no `discard`. It is the shading itself: about 30 `AnnaSurface` shaders of about 3,000 MSL lines and 23 texture samples, 62% of the draws through the texture table. The most used one has 184 reads through the argument buffer and 96 `precise::` calls. Which of these costs most is not measured.
+- **Attachment traffic:** about 390 MB loaded and 450 MB stored a frame, and about 110 of the frame's roughly 165 passes load and store every attachment, by the host's count. `DM_NVN_TBDR=1` does not help: 396 and 413 MB, 25 to 27 fps, with the picture still right in the one frame checked (4 profiled frames, another moment of play).
+- **Not thermal, so far:** the tiny passes, a GPU clock proxy, stay at 15 to 17 us through a 5-minute run on this fanless Air.
+- **Idle between encoders:** 5 to 9 ms of each frame's span, of which about 3.5 ms is about 130 small gaps of 20 to 30 us. The game draws about 60 one-draw passes for mip chains and cube faces a frame.
+- **CPU, not the frame rate's limit:** [the texture table](../../../docs/reference/shaders.md#a-texture-table-walked-whole-for-every-change) was 44% of the Presentation Thread and is now 1.1%, and the thread went from 27% to 14% of a core (Time Profiler, one run each). Over 78 s of golf it walked 29 times and made 1,849 versions, only 19 with a new buffer, for 100 ms in all. The frame rate barely moved, as expected when the GPU is the limit: about 25 to 27 fps in the expensive stretches of both runs, and 31 to 36 before against 33 to 40 after in the cheap ones, with different play in each, so 1 or 2 fps at most can be credited to this. The GPU's idle time between encoders did not change. `pool_scan_bound` is what remains, 12.6% of the thread, about 2% of a core.
+
 ## Other open items
 
 - Shaders `a77a3a7b19f29a89` and `c7772ae369ee1c0e` are missing from the shader map, and one mesh draw is skipped.
@@ -62,6 +72,7 @@ Value `0xd142ed7d` is a table of registered account IDs. A save from elsewhere h
 - A dump tool's `.listing` files in the RomFS made the game take an empty equipment name; `romfs_image.py` leaves them out.
 - The memory rules above.
 - [A special register the translator did not know](../../../docs/reference/shaders.md#a-special-register-the-translator-did-not-know): the water's red.
+- [A texture table walked whole for every change](../../../docs/reference/shaders.md#a-texture-table-walked-whole-for-every-change): about 3 walks a frame in golf.
 - [Output streams](../../../docs/reference/audio.md#output-streams-sdk-22): the menu movie's sound.
 - [SensorFusion and NpadImu](../../../docs/reference/services.md#sensorfusion-and-npadimu-switch-2-sdks) and [a lone right Joy-Con on the Mac](../../../docs/reference/services.md#a-lone-right-joy-con-on-the-mac).
 - Host calls first needed here: `nn::fs::MountRamDisk`, the game's own save mounted read-only, Home button protection, `GetJcmsState`, Joy-Con icon colours, and virtual output devices.

@@ -1241,6 +1241,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Check:** `t_pool_chunks`.
 - **Open:** a handle put together in the shader, or read through a pointer, is not seen, and its draw reads the dummy. Only past the budget, and none is known.
 
+### A texture table walked whole for every change
+
+- **Symptom:** the thread that encodes spends much of its time in `pool_gpu` (`tex_fast_rid`, `tex_by_id`, `pool_holds`) in Time Profiler, while the frame's textures do not change. The `pool for handles traced to no slot` line counts walks in the thousands.
+- **Cause:** a table was built again whenever any texture or sampler was registered, any memory pool came or went, or any serial changed, and each build walked every ID. Once a sparse mapping existed, every serial change also started a new [texture ID epoch](nvn-objects.md#texture-id-views-revalidated-only-for-the-serials-that-changed), so each walk checked every ID again.
+- **Fix:** `nvn_mtl.m`, for every game. Every way an ID's view can change logs that ID (`plog`), and a table takes the logged IDs (`pool_gpu`). A new version is made only if an entry differs, and it comes from a spare whose submissions have completed, so it needs no new buffer or residency commit. A table walks again only for a new epoch, a table more than 1,024 changes behind, or a memory pool, which can give an ID its storage, while every registered texture is still being made. A walk that finds the same entries keeps its buffer, and with it the argument blocks that hold its address. Only a sparse mapping that moved starts an epoch. Past the [budget](#a-texture-table-past-its-memory-budget), an ID with no texture is skipped before its storage is checked. The old walks also happened to notice guest writes to a texture only a table reads, so `pool_pkg_check` now checks those textures, at most once a submission, when a protected page was written. That check is new behaviour for a game with no other changes, which never had its table refreshed. The memory stats line reports walks, versions, unchanged checks and new buffers.
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md): about 3 walks a frame of 33,024 IDs, each about 3.7 ms and a new 264 KB buffer. `pool_gpu` went from 43.5% to 1.1% of the Presentation Thread, and the thread from 27% to 14% of a core.
+- **Check:** `t_pool_table`.
+
 ### An array of handles in a uniform buffer
 
 - **Symptom:** the host stops at the shader's first load: `unexpected argument buffer layout: encodedLength=640 maxAid=48`.

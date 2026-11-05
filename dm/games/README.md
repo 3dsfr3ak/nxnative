@@ -80,6 +80,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [Digimon Story Cyber Sleuth: Complete Edition](010014E00DB56000/README.md) | `010014E00DB56000` | 1.0.3 | 6.4.0 | Media.Vision MVGL | OpenGL |
 | [Donkey Kong Bananza](040074A01BF12000/README.md) | `040074A01BF12000` | v458752 (Switch 2) | 20.5.19 (Ounce) | Nintendo EPD (sead / agl / gsys) | NVN2 |
 | [Splatoon Raiders](0400380020056000/README.md) | `0400380020056000` | v65536 (Switch 2) | 21.4.4 (Ounce) | Nintendo EPD (sead / agl / gsys) | NVN2 |
+| [Nintendo Switch Sports Resort](04008E001F098000/README.md) | `04008E001F098000` | v65536 (Switch 2) | 22.2.10 (Ounce) | Nintendo's sead / agl / gsys, Pia, Havok | NVN2 |
 | [Donkey Kong Country Returns HD](01009D901BC56000/README.md) | `01009D901BC56000` | 1.1.0 | 18.3.5 | Unity 6000.0.28f1 IL2CPP | NVN |
 | [Donkey Kong Country: Tropical Freeze](0100C1F0051B6000/README.md) | `0100C1F0051B6000` | 1.0.2 | 4.4.0 | Retro Studios' engine | NVN |
 | [DRAGON QUEST I & II HD-2D Remake](0100D7C01F254000/README.md) | `0100D7C01F254000` | 1.0.2 | 18.3.2 | Unreal Engine 4.27.2 | NVN |
