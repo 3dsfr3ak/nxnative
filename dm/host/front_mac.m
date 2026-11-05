@@ -298,13 +298,13 @@ static int hidpad_motion_player(hid_pad *d) { return g_input_on ? hidpad_slot(d)
 static void hidpad_attach(hid_pad *d) {
     int p = g_merge ? 0 : pad_slot_take(&g_slots, d, d->name); char nb[16];
     if (p < 0) { LOG("controller '%s' (HID) connected: all %d players are taken, not used", d->name, DM_PLAYERS); return; }
-    if (d->jc) dm_motion_right_only(p, 1);
+    if (d->jc) { dm_motion_right_only(p, 1); dm_player_detached(p, 1); }
     npad_name(p, nb, sizeof nb); LOG("controller '%s' (HID) connected: player %d (npad %s)", d->name, p + 1, nb);
     if (!g_merge) dm_pad_players(pad_slot_mask(&g_slots));   // merged, every controller is player 1, as pads_changed has it
     hidpad_read(d);
 }
 static void hidpad_detach(hid_pad *d) {   // d is already off g_hidpads
-    if (d->jc) { int was = hidpad_slot(d); if (was >= 0) { dm_motion_clear_hid(was); dm_motion_right_only(was, 0); } }
+    if (d->jc) { int was = hidpad_slot(d); if (was >= 0) { dm_motion_clear_hid(was); dm_motion_right_only(was, 0); dm_player_detached(was, 0); } }
     if (g_merge) {   // as pads_changed: released when the last controller goes away
         LOG("controller '%s' (HID) disconnected", d->name);
         if (!merge_pads_left(nil)) dm_pad_set(0, 0, 0, 0, 0);

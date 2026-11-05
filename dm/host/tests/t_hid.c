@@ -141,6 +141,27 @@ static void t_npads(void) {
     CHECK(buttons_of(NPAD_HANDHELD, STYLE_HANDHELD) == DM_BTN_Y && buttons_of(1, STYLE_FULLKEY) == DM_BTN_L, "handheld: each player its own input");
     h_hid_ShowCtrl(info, NULL);
     CHECK(info[0] == 2 && info[1] == NPAD_HANDHELD, "handheld: the applet selects the handheld controller");
+
+    // A Joy-Con over Bluetooth is not on the console's rails: player 1 on No1, as in tabletop mode, with the console still in handheld mode
+    dm_player_detached(1, 1);
+    CHECK(dm_player_npad(0) == NPAD_HANDHELD, "detached: player 2's Joy-Con leaves player 1 on Handheld");
+    dm_player_detached(1, 0); dm_player_detached(0, 1);
+    CHECK(dm_opmode() == 0 && dm_player_npad(0) == 0 && dm_player_npad(1) == 1, "detached: player 1 on No1, player 2 on No2");
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY && h_hid_GetStyle(&(uint32_t){NPAD_HANDHELD}) == 0, "detached: a style on No1, none on Handheld");
+    CHECK(buttons_of(0, STYLE_FULLKEY) == DM_BTN_Y && buttons_of(NPAD_HANDHELD, STYLE_HANDHELD) == 0, "detached: player 1's input on No1 only");
+    h_hid_ShowCtrl(info, NULL);
+    CHECK(info[0] == 2 && info[1] == 0, "detached: the applet selects No1");
+    h_hid_SetStyles(0x6);
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_JOYDUAL, "detached: a game of handheld and dual styles gets dual, where its motion is");
+    h_hid_SetStyles(0xffffffffu);
+    ids((const uint32_t[]){NPAD_HANDHELD}, 1);
+    CHECK(dm_player_npad(0) == NPAD_HANDHELD && h_hid_GetStyle(&(uint32_t){NPAD_HANDHELD}) == STYLE_HANDHELD, "detached: a game with no No1 keeps Handheld");
+    ids((const uint32_t[]){0, 1, 2, 3, NPAD_HANDHELD}, 5);
+    dm_player_detached(0, 0);
+    CHECK(dm_player_npad(0) == NPAD_HANDHELD && h_hid_GetStyle(&(uint32_t){0}) == 0, "the Joy-Con gone: player 1 back on Handheld");
+    g_mode = 1; dm_player_detached(0, 1);
+    CHECK(dm_player_npad(0) == 0 && h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY, "docked: No1 either way");
+    dm_player_detached(0, 0); g_mode = 0;
 }
 
 static dm_haptic_state vibration[DM_PLAYERS];

@@ -352,6 +352,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md). Not done: a left Joy-Con, a pair as one controller, SL and SR, Home and Capture, rumble.
 - **Check:** `t_joycon`; `t_hid` for the right half.
 
+### A Joy-Con that does nothing in handheld mode
+
+- **Symptom:** with Console mode on Handheld, a Joy-Con that is set up and has live motion does nothing. The log says `(npad handheld)` when it connects, then repeats `oe library applet: controller support` and `hid controller applet: 1 to 1 players wanted, 1 connected` many times a second.
+- **Cause:** the host put player 1 on the Handheld npad whenever the console was in handheld mode. That npad means Joy-Cons on the console's rails, which a Joy-Con over Bluetooth is not. A game that needs a detached Joy-Con asks for one through the controller applet, and the host's applet closes at once with nothing changed.
+- **Fix:** `hle_hid.c`, for every game. A Joy-Con over Bluetooth as player 1 (`dm_player_detached`, from `front_mac.m`) plays on No1 with the console still in handheld mode, as tabletop mode does on a Switch. A game that supports no No1 keeps Handheld. Other controllers are not changed.
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md): 295 applet openings in under a minute.
+- **Check:** `t_hid`.
+
 ### SDK 20 six-axis sensor and amiibo (`nfp`) calls
 
 - **Symptom:** SDK 20 calls that reach a service; `nfp`'s `AttachActivateEvent` / `AttachDeactivateEvent` crashed in the SDK at `sdk+0x3f2a78`.
