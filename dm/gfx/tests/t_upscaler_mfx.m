@@ -2,7 +2,8 @@
 // 1920x1080 image is replaced by the spatial scaler, which fills the whole image with the texture's colour; equal sizes, another shader, and DM_UPSCALER unset
 // (the last run) leave the dispatch to the shader. Runs under any profile: the named shader is the profile's first upscaler (DM_GAME_UPSCALER_KEYS), and a profile with
 // none swaps no shader; the MetalFX draw itself (up_mfx_encode) does not look at the key. The colour (up_mfx_color) comes from synthetic code holding the curves' constants: a variant with sRGB input
-// comes out decoded to linear, and one whose output stays encoded is left to its shader
+// comes out decoded to linear, and one whose output stays encoded is left to its shader. Under a profile with an upscaler chain (upscaler_chain: Ocarina of Time), the chain is drawn whole by
+// MetalFX at its last dispatch, and one that does not reach its last dispatch is refused from then on
 #include "../nvn/nvn_mtl.m"
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
@@ -129,12 +130,56 @@ int main(void) { @autoreleasepool {
         CHECK(up_mfx_encode(named), "linear input after sRGB at the same sizes");
         CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the second linear submission completes");
         CHECK(matches(written, colour, MTLRegionMake2D(0, 0, 1920, 1080), black), "the same sizes in linear colour are not decoded: each colour has its own scaler");
+        // Encoded colour that stays encoded (srgb 2: a movie's picture, nvn_ndve.inc ndve_mfx_resample): an RGBA8 1920x1080 picture into a 2560x1440 image comes out as it went in, not decoded
+        tex_t mov = texture(84, 1920, 1080, NVN_FORMAT_RGBA8), mout = texture(85, 2560, 1440, NVN_FORMAT_RGBA16F); mout.d.flags |= NVN_TEXTURE_FLAGS_IMAGE;
+        mtl_tex_init(&mov); mtl_tex_init(&mout); mtl_reg_tex(708, &mov, NULL); mtl_reg_image(709, &mout, NULL);
+        fill(tex_mtl(&mov), MTLClearColorMake(colour[0], colour[1], colour[2], colour[3])); fill(tex_mtl(&mout), MTLClearColorMake(0, 0, 0, 1));
+        os_unfair_lock_lock(&g_rmu); id<MTLTexture> mv = tex_by_id(708), mo = tex_by_id(709); os_unfair_lock_unlock(&g_rmu);
+        mtl_sub_begin();
+        CHECK(up_mfx_run(mv, mo, 85, (NVNcopyRegion){0, 0, 0, 1920, 1080, 1}, (NVNcopyRegion){0, 0, 0, 2560, 1440, 1}, 2, "movie"), "MetalFX takes an encoded picture that stays encoded");
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the encoded picture's submission completes");
+        CHECK(matches(mo, colour, MTLRegionMake2D(0, 0, 2560, 1440), black), "the encoded picture comes out as it went in, not decoded");
         NvShader *encoded_out = upscaler(key); encoded_out->up_color = UP_COLOR_KEEP;
         CHECK(!up_mfx_wanted(encoded_out), "a named shader whose output stays encoded is left to its shader");
         S.tex[5][0] = 701;
         S.img[5][1] = 703; { const uint32_t same_r[8] = {0, 0, 959, 539, 0, 0, 959, 539}; memcpy(S.push[1], same_r, sizeof same_r); } mtl_sub_begin(); uint64_t kept = g_up_mfx_kept;
         CHECK(!up_mfx_encode(named) && g_up_mfx_kept == kept + 1, "an image no larger than the texture leaves the dispatch to the shader");
         mtl_wait(mtl_sub_commit(), 5000000000ull);
+    }
+    // A profile's upscaler chain (upscaler_chain, Ocarina of Time's four NDSR dispatches): with DM_UPSCALER=metalfx the first dispatch's texture is kept and every dispatch skipped, and at
+    // the last MetalFX fills its whole image; a chain that does not reach its last dispatch runs the game's dispatches from then on. A profile with no chain, or the game's upscaler, takes none
+    if (DM_GAME_UPSCALER_CHAIN_N >= 2) {
+        int n = DM_GAME_UPSCALER_CHAIN_N; NvShader *ch[8]; const char *k = DM_GAME_UPSCALER_CHAIN;
+        for (int i = 0; i < n; i++, k += *k == '*' ? 2 : 17) {   // a last place of * takes the dispatch after the others, whatever its key: one of the network's variants here
+            char ck[24]; snprintf(ck, sizeof ck, "%.16s_b", *k == '*' ? "7c511cc23ff85d14" : k); ch[i] = [NvShader new]; snprintf(ch[i]->key, sizeof ch[i]->key, "%s", ck);
+            ch[i]->rf.nb = 1; ch[i]->rf.b[0] = i == n - 1 ? (nvn_rbind){.kind = NVN_RB_IMG, .dtt = MTLTextureType2D, .dpf = NVN_DPF_FLOAT, .reg = 1, .rw = 1}
+                                                          : (nvn_rbind){.kind = NVN_RB_TEX, .dtt = MTLTextureType2D, .dpf = NVN_DPF_FLOAT, .reg = 3};
+        }
+        tex_t cin = texture(82, 854, 480, NVN_FORMAT_R11G11B10F), cout = texture(83, 2048, 1152, NVN_FORMAT_RGBA16F); cout.d.flags |= NVN_TEXTURE_FLAGS_IMAGE;
+        mtl_tex_init(&cin); mtl_tex_init(&cout); mtl_reg_tex(706, &cin, NULL); mtl_reg_image(707, &cout, NULL);
+        const float lit[4] = {1.5f, 0.5f, 0.25f, 1.0f};
+        fill(tex_mtl(&cin), MTLClearColorMake(lit[0], lit[1], lit[2], lit[3])); fill(tex_mtl(&cout), MTLClearColorMake(0, 0, 0, 1));
+        memset(&S, 0, sizeof S); S.tex[5][3] = 706; S.img[5][1] = 707;
+        p_dispatch dp = {.x = 32, .y = 18, .z = 1};
+        NvShader *other = upscaler("0123456789abcdef_b");
+        mtl_sub_begin(); int taken = 0;
+        for (int i = 0; i < n; i++) taken += up_chain_dispatch(ch[i], &dp);
+        CHECK(!up_chain_dispatch(other, &dp), "a shader outside the chain is never taken");
+        CHECK(taken == (on ? n : 0), on ? "every dispatch of the chain is taken" : "without DM_UPSCALER=metalfx the chain's dispatches run");
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the chain's submission completes");
+        os_unfair_lock_lock(&g_rmu); id<MTLTexture> cw = tex_by_id(707); os_unfair_lock_unlock(&g_rmu);
+        CHECK(matches(cw, on ? lit : black, MTLRegionMake2D(0, 0, 2048, 1152), black), on ? "MetalFX filled the last dispatch's whole image with the first one's colour" : "and the image is untouched");
+        if (on) {
+            mtl_sub_begin();
+            if (n >= 3 && up_chain_index(ch[2]) == 2) {
+                CHECK(up_chain_dispatch(ch[0], &dp) && !up_chain_dispatch(ch[2], &dp) && g_up_chain_failed, "a dispatch of the chain out of its order is refused");
+                g_up_chain_failed = 0; g_up_chain_armed = 0;
+            }
+            CHECK(up_chain_dispatch(ch[0], &dp) && up_chain_dispatch(ch[1], &dp), "a chain begins");
+            CHECK(!up_chain_dispatch(ch[0], &dp) && g_up_chain_failed, "a chain that did not reach its last dispatch is refused at the next first one");
+            CHECK(!up_chain_dispatch(ch[1], &dp) && !up_chain_dispatch(ch[n - 1], &dp), "from then on the game's dispatches run");
+            mtl_wait(mtl_sub_commit(), 5000000000ull);
+        }
     }
     printf("t_upscaler_mfx (%s): %d checks, %d failed\n", on ? "metalfx" : "game", checks, failed);
     return failed != 0;

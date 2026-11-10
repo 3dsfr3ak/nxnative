@@ -8,6 +8,13 @@ from nso_asm import ADRP, B
 # (the division's value when the host keeps frames 60 / rate vsyncs), and counts the vsyncs stepped. Until the host has decided a step, and at fps_target 0, the division runs.
 # s0 and x16 / x17 are free there (s0 is written again on every path before it is read; the function uses neither x16 nor x17); s1 keeps the base rate.
 # Lichii (a GPL emulator; only the fact was taken) found the division (its notes: main+0x6E6CC4, 60 / [x21+0x2C8])
+# The world step (the profile's world_step, DM_DYNAMIC_FPS overrides; the WORLD_STEP capability, so the loader may set it): on the division's path, the step in frames becomes the
+# larger of the game's own and s1 (the base rate) × the frame time the host measures at each present (state +0x114, float seconds, 0 at the target rate; hle_nvn.c nvn_fdelta_next),
+# while state +0x110 is 2. Frames are not held, so the pacing is the game's own and game time = real time below the frame rate. The loader sets no frame-step target with it, so
+# the division's path is the one taken. +0x118 sums the frames stepped (a double) for the host's log against real time. x16, x17 and s0 are free here (above); s2 and s3 are
+# read by no path from the site to the function's next call (a fork's oot2 branch, which took the idea from gunvalk's zortos293/Lichii PR #216 and ran it in play for days)
+_world_step_build = 'e0f3ccfaf50065ae4ea01eb5aeb13b1a'   # v131072 main, where the world step's registers were checked
+_frame_ratio_why = 'frame ratio: the host\'s step × base rate / 60 instead of base rate / the game\'s frame rate (state page target fps; 0 = the game\'s ratio)'
 def frame_step(ctx):
     here, emit, fs_site, fs_put, FS_STATE_OFF, base = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state, ctx.base
     site = base + 0xe4
@@ -29,8 +36,24 @@ def frame_step(ctx):
               0x1e201908):  # fdiv s8,s8,s0          / 60
         emit(w)
     emit(B(here(), site + 4))
-    emit(0x1e201828); emit(B(here(), site + 4))   # orig: fdiv s8,s1,s0; back
-    fs_put(site, [B(site, start)], 'frame ratio: the host\'s step × base rate / 60 instead of base rate / the game\'s frame rate (state page target fps; 0 = the game\'s ratio)')
+    emit(0x1e201828)   # orig: fdiv s8,s1,s0
+    why = _frame_ratio_why
+    if getattr(ctx, 'build_id', None) == _world_step_build:   # the world step: s2 / s3 are known free on that build only (the docs' and tests' walks of the stubs give no build)
+        emit(ADRP(16, here(), FS_STATE_OFF))
+        for w in (0xb9411211,   # ldr w17,[x16,#0x110]   the world step (2 = measured, 0 = off)
+                  0x34000111,   # cbz w17,back (+8)
+                  0xbd411602,   # ldr s2,[x16,#0x114]    the host's measured frame time, in seconds (0 at the target rate)
+                  0x1e210842,   # fmul s2,s2,s1          in frames
+                  0x1e224908,   # fmax s8,s8,s2          never below the game's own step
+                  0xfd408e03,   # ldr d3,[x16,#0x118]
+                  0x1e22c102,   # fcvt d2,s8
+                  0x1e622863,   # fadd d3,d3,d2
+                  0xfd008e03):  # str d3,[x16,#0x118]    frames stepped
+            emit(w)
+        ctx.capabilities.add('WORLD_STEP')
+        why += ', or with the world step the larger of the game\'s ratio and the measured frame time (state +0x110)'
+    emit(B(here(), site + 4))   # back
+    fs_put(site, [B(site, start)], why)
     dynamic_resolution(ctx)
 
 # The game's dynamic resolution (game__gfx__DynamicResolutionParam: LoadThreshold, ReduceCounterMax, IncreaseCounterMax and a list of levels, each a ResolutionReduceScale and a

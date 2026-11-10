@@ -184,7 +184,15 @@ namespace Ryujinx.Graphics.Shader.Instructions
                     src = EmitLoadSubgroupMask(context, IoVariable.SubgroupGeMask);
                     break;
 
+                case SReg.VariableRate:
+                    // Switch 2: the fragment's shading rate, its width in byte 1 and its height in byte 2. The host has no variable rate shading, so every fragment is 1x1.
+                    // Nintendo Switch Sports Resort multiplies them and divides by the result, so the 0 of the default below made its water NaN (611 pixel shaders read it).
+                    src = Const(0x00010100);
+                    break;
+
                 default:
+                    // Says so: a register read as 0 by mistake shows up only as a wrong picture.
+                    context.TranslatorContext.GpuAccessor.Log($"Special register {(int)sreg} is not implemented: it reads as 0.");
                     src = Const(0);
                     break;
             }

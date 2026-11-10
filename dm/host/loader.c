@@ -266,6 +266,7 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "DATA_OFF")) m->data_off = v;
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
         else if (!strcmp(key, "RENDER_SCALE")) m->render_scale_max = (uint32_t)v;
+        else if (!strcmp(key, "WORLD_STEP")) m->world_step = v != 0;
         else if (!strcmp(key, "UE_MALLOC_VT")) m->ue_malloc_vt = v;
         else if (!strcmp(key, "UE_MALLOC_SLOT")) m->ue_malloc_slot = (unsigned)v;
         else if (!strcmp(key, "FPS_TARGET_PTR")) m->fps_target_ptr = v;
@@ -307,10 +308,12 @@ static void read_layout(module_t *m, const char *dir) {
 uint8_t *dm_fps_state;
 static const char *g_fps_mod;   // the module holding the state page (for the log)
 static float g_render_scale_max = 1.0f;   // the render-scale stub's largest scale (RENDER_SCALE in its fixups table; 1 for a stub that only lowers the game's size)
+static int g_world_step;   // the stub has the world step (WORLD_STEP in its fixups table)
 static void install_fps_state(module_t *m) {
     if (m->fps_state_off + 0x40 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
     dm_fps_state = m->base + m->fps_state_off; g_fps_mod = m->name;
     if (m->render_scale_max > 1) g_render_scale_max = (float)m->render_scale_max;
+    g_world_step = m->world_step;
 }
 // The settings in the state page, written when the game starts (main.c, after host loading): on iOS the loading runs at app launch, before the launcher has set DM_FPS_TARGET and
 // DM_RENDER_SCALE (Launcher.swift), and nothing reads the page before the game runs
@@ -318,6 +321,14 @@ void dm_fps_state_apply(void) {
     if (!dm_fps_state) return;
     const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
     if (t != 0 && t != 30 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30 or 60; using the game's own frame step", e); t = 0; }
+    // The world step (builds whose stub has it, the WORLD_STEP capability: Ocarina of Time's patches.py): 2 steps the world by the frame time measured at each present, with no
+    // frame held (state +0x110; hle_nvn.c writes the time to +0x114), so game time keeps real time below the frame rate and the frame rate is the game's own. It takes the place
+    // of the frame step: the launcher's Game speed (DM_DYNAMIC_FPS 2 or 0) decides, the profile's world_step when it is unset; 0 leaves the frame step at DM_FPS_TARGET
+    const char *dy = getenv("DM_DYNAMIC_FPS"); uint32_t ws = dy ? (uint32_t)atoi(dy) : DM_GAME_WORLD_STEP;
+    if (dy && strcmp(dy, "0") && strcmp(dy, "2")) { LOG("[RED] DM_DYNAMIC_FPS=%s: must be 0 or 2; the world steps as the profile says", dy); ws = DM_GAME_WORLD_STEP; }
+    if (ws && !g_world_step) { if (dy) LOG("[RED] DM_DYNAMIC_FPS=%s: this build has no world step stub; ignored", dy); ws = 0; }
+    memcpy(dm_fps_state + 0x110, &ws, sizeof ws);
+    if (ws) { LOG("%s: the world's step follows the frame time measured at each present (%s); no frame step, frames are not held", g_fps_mod, dy ? "DM_DYNAMIC_FPS" : "game profile world_step"); t = 0; }
     float f = (float)t; memcpy(dm_fps_state, &f, sizeof f);
     // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880, Hades II's render size): 1.0 keeps the game's own size
     // and dynamic resolution; another factor fixes the size at that fraction (DM_RENDER_SCALE, 0.5 to the stub's largest scale: 1.0, or above for a stub that also raises it,

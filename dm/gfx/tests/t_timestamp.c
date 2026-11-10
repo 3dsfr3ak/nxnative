@@ -1,6 +1,8 @@
-// NVN raw timestamp ABI: known vectors, long uptimes and an independent game's inline conversion.
+// NVN raw timestamp ABI: known vectors, long uptimes and an independent game's inline conversion, on the Switch (614.4 MHz) and the Switch 2 (31.25 MHz).
 #include "../nvn/nvn_timestamp.h"
 #include <stdio.h>
+
+int dm_sdk_ounce(void) { return 0; }   // a Switch game: the default rate (loader.c answers from the sdk module)
 
 static int checks, fails;
 #define CHECK(c, why) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s\n", why); } } while (0)
@@ -44,6 +46,19 @@ int main(void) {
     CHECK(nier_dr_ms(nvn_timestamp_from_ns(16000000)) == 16.0f, "NieR sees a 16 ms GPU report as 16 ms");
     CHECK(nier_dr_ms(nvn_timestamp_from_ns(1000000000)) == 1000.0f, "NieR sees a 1 second GPU report as 1000 ms");
     CHECK(nier_dr_ms(307200) == 0.5f, "old 19.2 MHz report of 16 ms was read as 0.5 ms");
+    CHECK(nvn_ts_hz() == NVN_TS_HZ_NX, "a Switch game's reports run at 614.4 MHz");
+    // The Switch 2: the system counter's 31.25 MHz, 32 ns a tick. Ocarina of Time divides a raw span by 31,250,000 for its wind step: 17.58 ms of GPU time must read as 17.58 ms
+    const struct { uint64_t ns, ticks; } ounce[] = {{0, 0}, {32, 1}, {1000000, 31250}, {17580000, 549375}, {1000000000, 31250000}, {UINT64_C(5000000000000000000), UINT64_C(156250000000000000)}};
+    for (unsigned i = 0; i < sizeof ounce / sizeof *ounce; i++) {
+        CHECK(nvn_ts_from_ns_at(ounce[i].ns, NVN_TS_HZ_OUNCE) == ounce[i].ticks, "known ns -> 31.25 MHz ticks");
+        CHECK(nvn_ts_to_ns_at(ounce[i].ticks, NVN_TS_HZ_OUNCE) == ounce[i].ns, "known 31.25 MHz ticks -> ns");
+    }
+    CHECK(nvn_ts_from_ns_at(17580000, NVN_TS_HZ_OUNCE) / 31250000.0 == 0.01758, "a 17.58 ms span read at 31.25 MHz is 17.58 ms, not 0.3456 s");
+    for (unsigned i = 0; i < sizeof ns / sizeof *ns; i++) {
+        uint64_t back = nvn_ts_to_ns_at(nvn_ts_from_ns_at(ns[i], NVN_TS_HZ_OUNCE), NVN_TS_HZ_OUNCE);
+        CHECK(back <= ns[i] && ns[i] - back < 32, "31.25 MHz round trip loses less than a tick, including long uptime");
+    }
+    CHECK(nvn_ts_to_ns_at(nvn_ts_from_ns_at(1000000, 19200000), 19200000) == 1000000, "another rate (DM_NVN_TS_HZ) converts both ways");
     printf("timestamp: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

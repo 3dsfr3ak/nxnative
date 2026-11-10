@@ -280,6 +280,8 @@ enum { MTL_REWRITE_UPLOADED, MTL_REWRITE_GPU, MTL_REWRITE_GPU_NOW };     // mtl_
 int mtl_tex_cpu_rewritten(const tex_t *t);                               // nvn_ft_poll: the CPU wrote a registered texture's pages after its first use (MTL_REWRITE_*)
 // hle_nvn.c: a texture tex_flush_upload / tex_dirty_upload registered and has not resolved yet; GPU copies written into the destination texture's storage as well (see there)
 int nvn_ft_tracked(uint64_t serial);
+int nvn_ft_read(const tex_t *t, int armed_too);   // ReadTexels (armed_too) or a first use off the submit thread: take it from its storage (hle_nvn.c)
+int mtl_tex_first_use_reads(const tex_t *t);       // nvn_mtl.m: its first use takes the content from its storage whatever the GPU did (ft_add protects it only then)
 // The storage ranges a copy's mirror made writable and wrote, as addresses [lo, hi): the host's own write, which pkg_copy_absorb (nvn_mtl.m) excepts. The caller sets n = 0;
 // n = −1 when there were more than fit (that copy is then not absorbed)
 typedef struct { int n; uintptr_t r[64][2]; } mspan_t;

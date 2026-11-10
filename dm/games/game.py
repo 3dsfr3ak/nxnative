@@ -161,6 +161,8 @@ def header_one(g):
     if pi not in ('game', 'display'): sys.exit(f'{g.id}: present_interval must be game or display: {pi}')
     ft = g.get('fps_target', '0')   # frame rate cap of the rewriter's frame step (FRAME_STEP in the profile's patches.py: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0) or of the engine's own frame limit (hle_fpslock.c): 0 = the game's own step, 30 / 60
     if ft not in ('0', '30', '60'): sys.exit(f'{g.id}: fps_target must be 0, 30 or 60: {ft}')
+    wst = g.get('world_step', 'off')   # the world's step from the frame time measured at each present, for a build whose frame step stub has it (the WORLD_STEP capability; loader.c, DM_DYNAMIC_FPS overrides): off / measured; it takes the place of the frame step
+    if wst not in ('off', 'measured'): sys.exit(f'{g.id}: world_step must be off or measured: {wst}')
     fm = g.get('fps_max', '60')   # the highest rate fps_target and the player's Frame rate may take: 120 only for a game checked at that speed (hle_nvn.c fps_high)
     if fm not in ('60', '120'): sys.exit(f'{g.id}: fps_max must be 60 or 120: {fm}')
     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
@@ -204,6 +206,11 @@ def header_one(g):
     mml = g.get('mem_map_limit', 'off')   # MapPhysicalMemory refused beyond the application pool, as on Horizon (hle_svc.c): on / off
     if mml not in ('on', 'off'): sys.exit(f'{g.id}: mem_map_limit must be on or off: {mml}')
     ups = upscaler_keys(g)   # the game's own upscaler shaders, which DM_UPSCALER=metalfx (the launcher's Game's upscaler) replaces with MetalFX's spatial scaler (nvn_mtl.m up_mfx_encode)
+    uch = [k for k in g.get('upscaler_chain', '').split(',') if k]   # a game's upscaler of several compute dispatches, in order (the first reads the colour, the last writes the output image; * last: the dispatch right after the others), which DM_UPSCALER=metalfx draws whole with MetalFX (nvn_mtl.m up_chain_dispatch)
+    if uch and not (2 <= len(uch) <= 8 and all(re.fullmatch(r'[0-9a-f]{16}', k) or (k == '*' and n == len(uch) - 1) for n, k in enumerate(uch))):
+        sys.exit(f'{g.id}: upscaler_chain must be 2 to 8 comma-separated 16-digit shader keys, the last one also *: {g.get("upscaler_chain", "")}')
+    dov = g.get('dispatch_overlap', 'off')   # the game's dispatches with no barrier of its between them run side by side in the copy encoder (nvn_mtl.m dispatch_enc; DM_NVN_DISPATCH_OVERLAP overrides): on / off
+    if dov not in ('on', 'off'): sys.exit(f'{g.id}: dispatch_overlap must be on or off: {dov}')
     dbr = g.get('draw_barriers', 'full')   # how draw passes are ordered (nvn_mtl.m barrier_game): full = each waits for all earlier GPU work, game = by the game's own barriers, so vertex work overlaps the previous pass's fragments
     if dbr not in ('full', 'game'): sys.exit(f'{g.id}: draw_barriers must be full or game: {dbr}')
     gts = g.get('gpu_timestamps', 'submission')   # counter timestamps (nvn_mtl.m rep_ticks): submission = one time per submission, segment = the GPU start / end of the segment holding the report
@@ -245,6 +252,7 @@ def header_one(g):
          f'#define DM_GAME_CORE_PREEMPT {int(cp == "on")}',
          f'#define DM_GAME_ALLOC_BIG_ALIGN {int(aba == "on")}',
          f'#define DM_GAME_FPS_TARGET {int(ft)}',
+         f'#define DM_GAME_WORLD_STEP {2 if wst == "measured" else 0}',
          f'#define DM_GAME_FPS_MAX {int(fm)}',
          f'#define DM_GAME_FPS_HOLD {int(fh == "on")}',
          f'#define DM_GAME_UE_TEXTURE_POOL {int(utp)}',
@@ -263,7 +271,9 @@ def header_one(g):
          f'#define DM_GAME_TEX_DYN_SLOTS {int(tds == "on")}',
          f'#define DM_GAME_GPU_TS_SEGMENT {int(gts == "segment")}',
          f'#define DM_GAME_DRAW_BARRIERS_GAME {int(dbr == "game")}',
+         f'#define DM_GAME_DISPATCH_OVERLAP {int(dov == "on")}',
          f'#define DM_GAME_UPSCALER_KEYS {q(",".join(ups))}', f'#define DM_GAME_UPSCALER_N {len(ups)}',
+         f'#define DM_GAME_UPSCALER_CHAIN {q(",".join(uch))}', f'#define DM_GAME_UPSCALER_CHAIN_N {len(uch)}',
          f'#define DM_GAME_VCONV_RANGE {int(vcr == "on")}',
          *([f'#define DM_GAME_NVN_API_MAJOR {api.split(".")[0]}', f'#define DM_GAME_NVN_API_MINOR {api.split(".")[1]}'] if g.get('device_api', '') else []),   # without the key: by the SDK version (hle_nvn.c nvn_api)
          '']

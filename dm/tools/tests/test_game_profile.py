@@ -49,14 +49,24 @@ MAP = ('# kind: evidence  Test shaders\n# column 5 records where each key first 
        'cs_other.bin\t5\tcompute\t0123456789abcdef\t/Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc.zs/agl_common.sharcb#BAHS@0x40\n')
 
 
-def macros(shader_map):
-    """The upscaler macros of a synthetic profile's header, with this shader map (None: none)"""
+def macros(shader_map, extra=''):
+    """The upscaler macros of a synthetic profile's header, with this shader map (None: none) and these game.tsv rows added"""
     with tempfile.TemporaryDirectory() as d:
         Path(d, ID).mkdir()
-        (Path(d, ID) / 'game.tsv').write_text(TSV)
+        (Path(d, ID) / 'game.tsv').write_text(TSV + extra)
         if shader_map is not None: (Path(d, ID) / 'shader_map.tsv').write_text(shader_map)
         subprocess.run([sys.executable, str(GAME), 'header', ID, str(Path(d, ID) / 'game.h')], env={**os.environ, 'DM_GAMES_DIR': d}, check=True, capture_output=True)
-        return [l for l in (Path(d, ID) / 'game.h').read_text().splitlines() if 'UPSCALER' in l]
+        return [l for l in (Path(d, ID) / 'game.h').read_text().splitlines() if 'UPSCALER' in l and 'UPSCALER_CHAIN' not in l]
+
+
+def chain(rows):
+    """The upscaler chain macros of a synthetic profile's header with these game.tsv rows, or the error that stopped it"""
+    with tempfile.TemporaryDirectory() as d:
+        Path(d, ID).mkdir()
+        (Path(d, ID) / 'game.tsv').write_text(TSV + rows)
+        r = subprocess.run([sys.executable, str(GAME), 'header', ID, str(Path(d, ID) / 'game.h')], env={**os.environ, 'DM_GAMES_DIR': d}, capture_output=True, text=True)
+        if r.returncode: return r.stderr.strip().splitlines()[-1]
+        return [l for l in (Path(d, ID) / 'game.h').read_text().splitlines() if 'UPSCALER_CHAIN' in l]
 
 
 class UpscalerKeys(unittest.TestCase):
@@ -65,6 +75,15 @@ class UpscalerKeys(unittest.TestCase):
         self.assertEqual(macros(None), none)
         self.assertEqual(macros(MAP.split('cs_other.bin')[0]), none)
         self.assertEqual(macros(MAP), ['#define DM_GAME_UPSCALER_KEYS "7629d857a0a93833,c56db3d5a0f1b5af"', '#define DM_GAME_UPSCALER_N 2'])
+
+    def test_chain(self):   # upscaler_chain: a game's upscaler of several dispatches, in order (Ocarina of Time's four NDSR dispatches)
+        self.assertEqual(chain(''), ['#define DM_GAME_UPSCALER_CHAIN ""', '#define DM_GAME_UPSCALER_CHAIN_N 0'])
+        self.assertEqual(chain('upscaler_chain\tf8965bffbdf51d78,d17eefaff4f0bc23,a335c1db6270c355,fa3033d05c0a41d6\n'),
+                         ['#define DM_GAME_UPSCALER_CHAIN "f8965bffbdf51d78,d17eefaff4f0bc23,a335c1db6270c355,fa3033d05c0a41d6"', '#define DM_GAME_UPSCALER_CHAIN_N 4'])
+        self.assertEqual(chain('upscaler_chain\tf8965bffbdf51d78,d17eefaff4f0bc23,a335c1db6270c355,*\n'),
+                         ['#define DM_GAME_UPSCALER_CHAIN "f8965bffbdf51d78,d17eefaff4f0bc23,a335c1db6270c355,*"', '#define DM_GAME_UPSCALER_CHAIN_N 4'])   # *: the dispatch after the others
+        for bad in ('f8965bffbdf51d78', 'f8965bffbdf51d78,d17eefaf', 'F8965BFFBDF51D78,d17eefaff4f0bc23', '*,f8965bffbdf51d78', 'f8965bffbdf51d78,*,d17eefaff4f0bc23'):
+            self.assertIn('upscaler_chain must be', chain(f'upscaler_chain\t{bad}\n'), bad)
 
 
 if __name__ == '__main__':

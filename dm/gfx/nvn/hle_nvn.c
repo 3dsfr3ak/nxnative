@@ -385,8 +385,9 @@ NVN(nvnTextureBuilderGetSparseTileLayout, void, const NVNtextureBuilder *b, NVNt
 // textures with content 0, and the G-buffer's base colour came out black. Textures that can hold such data (not render targets, not linear, no packaged layout, in a pool
 // the CPU can write) are registered by address range; a flush that covers part of one marks it CPU-written (mtl_tex_cpu_written: uploaded from guest memory, re-uploaded
 // when its pages change). Off by default: in another game a flushed range could cover an image a shader writes, whose GPU content the upload would replace
-// stamp: dirty-page generation at registration (tex_dirty_upload); span: its tracked range (nvn_dirty_span), so a check needs no search over every pool; edge_h: hashes of its bytes in its edge pages at the stamp (ft_edges_take), edged = they hold
-typedef struct { const uint8_t *mem; uint64_t size; tex_t t; uint64_t stamp; const void *span; uint64_t edge_h[2]; int edged; } flush_tex;
+// stamp: dirty-page generation at registration (tex_dirty_upload), or at the first use (armed); span: its tracked range (nvn_dirty_span), so a check needs no search over every pool; edge_h: hashes of its bytes in its edge pages at the stamp (ft_edges_take), edged = they hold;
+// armed: stamped and write-protected (ft_add, or ft_arm at its first use)
+typedef struct { const uint8_t *mem; uint64_t size; tex_t t; uint64_t stamp; const void *span; uint64_t edge_h[2]; int edged, armed; } flush_tex;
 static flush_tex *g_ft; static size_t g_nft, g_cft; static pthread_mutex_t g_ft_mu = PTHREAD_MUTEX_INITIALIZER;
 // Writes beside a registered texture (tex_dirty_upload). The tracker marks whole host pages (16 KB) dirty, and a texture's storage need not start or end on one: its first and last pages
 // are shared with whatever lies beside it, as for the packaged textures' re-uploads (pkg_edges_clean in nvn_mtl.m). The Great Ace Attorney Chronicles keeps its window textures and render
@@ -413,6 +414,7 @@ static void ft_edges_take(flush_tex *f) {   // right after the stamp and the pro
 }
 static uint64_t g_ft_edge_skips;
 static int ft_written(flush_tex *f) {   // g_ft_mu held: the CPU wrote the texture's bytes since its stamp. Only its edge pages written, with its bytes there unchanged: stamped again, 0
+    if (!f->armed) return 0;   // not protected before its first use, which takes its storage (ft_add): nothing to tell yet
     if (!nvn_dirty_since_span(f->span, f->mem, f->size, f->stamp)) return 0;
     if (!f->edged) return 1;
     uintptr_t r[2][2], ia, ie; ft_edge_ranges(f->mem, f->size, r, &ia, &ie);
@@ -433,10 +435,15 @@ static void ft_add(const tex_t *t) {
     // use in a profile with tex_dirty_upload. What the CPU wrote into the physical pages behind one is seen through the page table instead (tex_from_storage, sparse_look)
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->pool->vp || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
         (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return;
-    flush_tex f = {t->mem, t->L.size, *t, nvn_dirty_now(), NULL, {0, 0}, 0};
-    if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
+    // tex_dirty_upload protects the storage at the texture's first use, not here, when that first use takes its content from the storage anyway (mtl_tex_first_use_reads: a block-
+    // compressed texture): the fills that follow an initialization (a stream-in, a file read into the storage) then cost no page faults. Walking through Ocarina of Time's Hyrule Castle
+    // Town with protection from here: 89,563 write faults and 443,466 pages unprotected before host writes, and twice the long frames (measured on a fork's oot2 branch, bbcab01b).
+    // Any other texture (an uncompressed one, whose first use may leave the storage to the GPU) is protected here, as before
+    int armed = !DM_GAME_TEX_DIRTY_UPLOAD || !mtl_tex_first_use_reads(t);
+    flush_tex f = {t->mem, t->L.size, *t, nvn_dirty_now(), NULL, {0, 0}, 0, armed};
+    if (DM_GAME_TEX_DIRTY_UPLOAD && armed) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
     f.span = nvn_dirty_span(t->mem, t->L.size);
-    if (DM_GAME_TEX_DIRTY_UPLOAD) ft_edges_take(&f);
+    if (DM_GAME_TEX_DIRTY_UPLOAD && armed) ft_edges_take(&f);
     pthread_mutex_lock(&g_ft_mu);
     if (g_nft == g_cft && !(g_ft = realloc(g_ft, (g_cft = g_cft ? 2 * g_cft : 1024) * sizeof *g_ft))) die("flush_tex allocation failed");
     g_ft[g_nft++] = f;
@@ -451,13 +458,40 @@ static void ft_del(uint64_t serial) {
 // Profile tex_dirty_upload: Tears of the Kingdom fills some textures from the CPU after creating them and publishes them with no NVN flush at all (os::FlushDataCache runs
 // natively; its 121-layer ASTC terrain material arrays, 42 MB each). They stayed GPU-only textures with content 0, which ASTC decodes as the error colour, and the cave came out magenta.
 // ft_add write-protects a registered texture's pages, and on its first resolution (tex_mtl, submit thread) a write since then makes it CPU-written like a flushed one
-int nvn_ft_written(const tex_t *t) {
+// g_ft_mu held: as ft_add for one protected from its registration, at its first use (stamp, protection, then its edge pages read)
+static void ft_arm(flush_tex *f) { f->stamp = nvn_dirty_now(); nvn_dirty_protect(f->mem, f->size); f->armed = 1; ft_edges_take(f); }
+int nvn_ft_written(const tex_t *t) {   // at its first use on the submit thread: one ft_add left unprotected is protected now, before tex_cpu_content reads its storage, so the poll sees a later write
     if (!DM_GAME_TEX_DIRTY_UPLOAD || !t->serial) return 0;
     int r = 0; pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == t->serial) {
-        if (ft_written(&g_ft[i])) { r = 1; g_ft[i] = g_ft[--g_nft]; }
+        if (!g_ft[i].armed) ft_arm(&g_ft[i]);
+        else if (ft_written(&g_ft[i])) { r = 1; g_ft[i] = g_ft[--g_nft]; }
         break; }
     pthread_mutex_unlock(&g_ft_mu);
+    if (r) mtl_tex_cpu_written(t);
+    return r;
+}
+// ReadTexels (any thread, possibly before any draw uses the texture; armed_too 1), or a first use off the submit thread (armed_too 0, where main asked nothing before): whether to take
+// it from its storage. One protected: when the CPU wrote it since its stamp (armed_too only). One ft_add left unprotected cannot tell, so storage with data in it is taken, as its first
+// use would (tex_cpu_content), and one with none is protected from now on: Tears of the Kingdom reads its streamed block-compressed tiles back before any draw, and one left
+// unprotected read as zeros from the host texture would leave its roughness atlas empty
+int nvn_ft_read(const tex_t *t, int armed_too) {
+    if (!DM_GAME_TEX_DIRTY_UPLOAD || !t->serial) return 0;
+    int r = 0, cold = 0; pthread_mutex_lock(&g_ft_mu);
+    for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == t->serial) {
+        if (!g_ft[i].armed) cold = 1;
+        else if (armed_too && ft_written(&g_ft[i])) { r = 1; g_ft[i] = g_ft[--g_nft]; }
+        break; }
+    pthread_mutex_unlock(&g_ft_mu);
+    if (cold) {   // the scan outside g_ft_mu; then the entry is taken or protected, unless its first use came meanwhile
+        int data = 0; for (uint64_t k = 0; k < t->L.size && !data; k += 8) { uint64_t w = 0; memcpy(&w, t->mem + k, t->L.size - k < 8 ? t->L.size - k : 8); data = w != 0; }
+        pthread_mutex_lock(&g_ft_mu);
+        for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == t->serial) {
+            if (!g_ft[i].armed) { if (data) { r = 1; g_ft[i] = g_ft[--g_nft]; } else ft_arm(&g_ft[i]); }
+            else if (armed_too && ft_written(&g_ft[i])) { r = 1; g_ft[i] = g_ft[--g_nft]; }
+            break; }
+        pthread_mutex_unlock(&g_ft_mu);
+    }
     if (r) mtl_tex_cpu_written(t);
     return r;
 }
@@ -2118,6 +2152,15 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     dm_ue_cvar_tick();
     if (fps_high()) high_cap_tick();
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 4), (uint32_t)dm_movie_playing(), __ATOMIC_RELAXED);   // the stubs' copy of the movie state (hle.h)
+    if (dm_fps_state && __atomic_load_n((uint32_t *)(dm_fps_state + 0x110), __ATOMIC_RELAXED) == 2 && !dm_detclock_enabled()) {   // the world step (loader.c): the frame time measured here
+        static nvn_fdelta fd; float s = nvn_fdelta_next(&fd, now_ns()); uint32_t b; memcpy(&b, &s, sizeof b);
+        __atomic_store_n((uint32_t *)(dm_fps_state + 0x114), b, __ATOMIC_RELAXED);
+        if (!(o->presents % 600)) {   // game time against real time (+0x118: the frames stepped, 1/60 s each)
+            static uint64_t t0; static double f0; uint64_t t = now_ns(), fb = __atomic_load_n((uint64_t *)(dm_fps_state + 0x118), __ATOMIC_RELAXED); double fr; memcpy(&fr, &fb, sizeof fr);
+            if (t0) LOG("[nvn] world step: game time %.2f s in %.2f s (%.3f of real time)", (fr - f0) / 60, (t - t0) / 1e9, (fr - f0) / 60 / ((t - t0) / 1e9));
+            t0 = t; f0 = fr;
+        }
+    }
     int c = fps_step_cap();
     if (dm_fps_state) { static int was; if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? (dm_movie_playing() ? " (movie playing)" : thermal_capped() ? " (thermal state serious)" : "") : ""); was = c; } }
     if (c) fstep_tick(o, c);

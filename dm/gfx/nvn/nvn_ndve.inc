@@ -59,6 +59,8 @@ static struct {
     id<MTLTexture> shadow, shadow_rs, game_out, game_rs;   // the engine's network output and resampled picture; the game's, to compare once its dispatch has run
     id<MTLBuffer> cnt;   // uint32: network texels that differ, the largest difference; the same for the resampler
     uint64_t chk_net, chk_rs;   // frames compared
+    // DM_UPSCALER=metalfx (ndve_mfx_resample): this frame's converted picture and the network's image, kept at 5a7d69b0 for MetalFX at 4f41ccf2 (or the network, late, if MetalFX does not take it)
+    id<MTLTexture> mfx_rgba, mfx_net; int mfx_net_id, mfx_off; uint64_t mfx_w, mfx_frames;
 } g_nd;
 static int ndve_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NDVE_ENGINE", 1); return m; }   // on by default; 0 off, ab (DM_AB phases)
 // DM_NDVE_ENGINE=check: the game's dispatches run, and the engine computes the same frame beside them into images of its own, compared with the game's (logged every 300 frames)
@@ -122,6 +124,26 @@ static id<MTLTexture> ndve_tex_id(NvShader *cs, int kind, int reg, int *id_out) 
     return nil;
 }
 static id<MTLTexture> ndve_tex(NvShader *cs, int kind, int reg) { return ndve_tex_id(cs, kind, reg, NULL); }
+// With the launcher's Game's upscaler: MetalFX (DM_UPSCALER=metalfx) the movie's picture is scaled by MetalFX instead of the network and its resampler: the network adds what it
+// learned to the picture and the resampler takes it to 4/3 (1920x1080 to 2560x1440), together 18.8 + 5.9 ms of an M2's (8 GPU cores) frame, so Ocarina's title and opening movies ran at
+// about 40 fps there; MetalFX's spatial scaler in perceptual mode (the picture is the movie's encoded colour, and stays so) takes the converted picture straight to the resampler's image.
+// The look changes (no network), as with the game's upscaler, so it is the player's choice; DM_UPSCALER=game keeps the network. The network's image is not written (the resampler alone reads
+// it); if MetalFX does not draw the frame, the network runs then, before the resampler, and the network is used from then on
+static int ndve_mfx_resample(NvShader *cs, id<MTLTexture> rgba, int net_id) {
+    int pid = 0, oid = 0; id<MTLTexture> pic = ndve_tex_id(cs, NVN_RB_TEX, 0, &pid), out = ndve_tex_id(cs, NVN_RB_IMG, 1, &oid);
+    const int32_t *c = (const int32_t *)S.push[1];
+    if (!pic || pid != net_id || !out || out.width != 2560 || out.height != 1440 || out.pixelFormat != MTLPixelFormatRGBA8Unorm || out.textureType != MTLTextureType2D ||
+        c[0] || c[1] || c[2] != 1919 || c[3] != 1079 || c[4] || c[5] || c[6] != 2559 || c[7] != 1439 || c[19]) {
+        static int once; if (!once++) MLOG("NDVE engine: the resampler's bindings or constants are not the model's (the network's picture to 2560x1440 RGBA8, no flip); MetalFX does not take the movie (logged once)");
+        return 0;
+    }
+    uint64_t dserial = 0;
+    os_unfair_lock_lock(&g_rmu); if (oid > 0 && oid < g_ntreg && g_treg[oid].ok) dserial = g_treg[oid].t.serial; os_unfair_lock_unlock(&g_rmu);
+    NVNcopyRegion ir = {0, 0, 0, 1920, 1080, 1}, orr = {0, 0, 0, 2560, 1440, 1};
+    if (!up_mfx_run(rgba, out, dserial, ir, orr, 2, cs->key)) return 0;
+    if (!g_nd.mfx_frames++) MLOG("NDVE engine: first movie frame scaled by MetalFX (DM_UPSCALER=metalfx), 1920x1080 → 2560x1440 with no network");
+    return 1;
+}
 // The network: 13 kernels in one compute encoder, ordered by barriers; input = the picture 5a7d69b0 reads, output = the image it writes
 static void ndve_encode(id<MTLTexture> rgba, id<MTLTexture> out, uint64_t wgpu) {
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
@@ -212,12 +234,18 @@ static int ndve_engine_dispatch(NvShader *cs, const p_dispatch *dp) {
     if (!chk && !g_nd.pos && !sw_on(ndve_mode())) return 0;   // an A/B phase changes only between sequences
     if (i == 0) {   // the colour conversion runs; a new frame's sequence may start. Under check, the game's resampled picture of the last frame is there now
         if (chk && g_nd.game_rs && g_nd.state == 2) ndve_compare(g_nd.game_rs, g_nd.shadow_rs, 1);
-        g_nd.game_rs = nil; g_nd.pos = 0; return 0;
+        g_nd.game_rs = nil; g_nd.pos = 0; g_nd.mfx_rgba = g_nd.mfx_net = nil; return 0;   // a kept picture whose resampler never came: that frame's movie picture was not updated
     }
     if (i == NDVE_N - 1) {   // the resampler: by the engine right after the engine's network, else the game's
         int take = g_nd.pos == 13;
         g_nd.pos = 0;
         if (!take) return 0;
+        if (g_nd.mfx_rgba) {   // DM_UPSCALER=metalfx: the picture by MetalFX; else the network now, as its image is not written yet
+            id<MTLTexture> rgba = g_nd.mfx_rgba, net = g_nd.mfx_net; g_nd.mfx_rgba = g_nd.mfx_net = nil;
+            if (ndve_mfx_resample(cs, rgba, g_nd.mfx_net_id)) return 1;
+            g_nd.mfx_off = 1; MLOG("[RED] NDVE engine: MetalFX did not take the movie's picture; the network runs from now on");
+            ndve_encode(rgba, net, g_nd.mfx_w);
+        }
         if (chk && g_nd.game_out) { ndve_compare(g_nd.game_out, g_nd.shadow, 0); g_nd.game_out = nil; }   // the game's network has run: its image against the engine's
         const p_bind_buf *w = &S.ssbo[5][2]; void *wb = NULL; uint64_t wo = 0;
         if (!w->addr || w->size < 0x3000 || !mtl_gpu_addr(w->addr, 0x3000, &wb, &wo, &g_nd.wrs)) { static int once; if (!once++) MLOG("NDVE engine: the resampler's weights are not bound; the game's resampler runs"); return 0; }
@@ -238,14 +266,18 @@ static int ndve_engine_dispatch(NvShader *cs, const p_dispatch *dp) {
     if (w->addr != g_nd.w0 + g_ndve_w[p] || b->addr != g_nd.w0 + g_ndve_b[p] || !w->size || !b->size) return ndve_fail(cs, "weights or biases not where the model's layers put them");
     if (p < 12) { g_nd.pos = p + 1; g_nd.skipped += !chk; return !chk; }
     // 5a7d69b0: the whole network now
-    int rgba_id = 0;
-    id<MTLTexture> rgba = ndve_tex_id(cs, NVN_RB_TEX, 4, &rgba_id), out = ndve_tex(cs, NVN_RB_IMG, 0);
+    int rgba_id = 0, out_id = 0;
+    id<MTLTexture> rgba = ndve_tex_id(cs, NVN_RB_TEX, 4, &rgba_id), out = ndve_tex_id(cs, NVN_RB_IMG, 0, &out_id);
     void *wb = NULL; uint64_t wo = 0, wgpu = 0;
     if (!rgba || !out || rgba.width != 1920 || rgba.height != 1080 || out.width != 1920 || out.height != 1080 || rgba.pixelFormat != MTLPixelFormatRGBA8Unorm ||
         out.pixelFormat != MTLPixelFormatRGB10A2Unorm || rgba.textureType != MTLTextureType2D || out.textureType != MTLTextureType2D)
         return ndve_fail(cs, "the picture or the image is not the model's 1920x1080 RGBA8 / RGB10A2 pair");
     if (rgba_id != g_nd.pic) return ndve_fail(cs, "the picture added to the network's output is not the one its first layer read");
     if (!mtl_gpu_addr(g_nd.w0, NDVE_WBYTES, &wb, &wo, &wgpu)) return ndve_fail(cs, "the weight table is in no memory pool");
+    if (!chk && !g_nd.mfx_off && up_mfx_on()) {   // DM_UPSCALER=metalfx: no network; the resampler's dispatch scales the picture (ndve_mfx_resample)
+        g_nd.mfx_rgba = rgba; g_nd.mfx_net = out; g_nd.mfx_net_id = out_id; g_nd.mfx_w = wgpu; g_nd.pos = 13; g_nd.frames++;
+        return 1;
+    }
     if (chk && !g_nd.shadow) g_nd.shadow = ndve_shadow(out);
     ndve_encode(rgba, chk ? g_nd.shadow : out, wgpu);
     if (chk) g_nd.game_out = out;   // compared once the game's 5a7d69b0 has written it, at 4f41ccf2

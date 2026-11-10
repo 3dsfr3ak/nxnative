@@ -1614,6 +1614,8 @@ static void blit_note(void);   // Per-pass dump: a copy / buffer update ended th
 // allocator gave out overlapping blocks, see hle_nvn.c zcull_size; NVN runs copies in order for any game)
 enum { BW_MAX = 64 };
 static uint64_t g_bw_lo[BW_MAX], g_bw_hi[BW_MAX], g_br_lo[BW_MAX], g_br_hi[BW_MAX]; static int g_bw_n, g_br_n, g_blit_ops; static uint64_t g_blit_barriers;
+static int g_blit_disponly = 1;   // since the copy encoder's last barrier only the game's dispatches went into it (dispatch_enc)
+static int g_cs_gbar;             // the game called nvnCommandBufferBarrier since its last dispatch (dispatch_enc)
 static uint64_t g_blit_splits;   // copies / buffer updates / fills that ended an open draw pass (the residency set line; a pass ended this way stores and the next one reloads its attachments)
 uint64_t mtl_blit_splits(void) { return g_blit_splits; }
 static int enc_open(void);
@@ -1633,7 +1635,7 @@ static void blit_barrier(void) {
     static int off = -1; if (off < 0) { const char *e = getenv("DM_NVN_BLIT_ORDER"); off = e && !strcmp(e, "0"); if (off) MLOG("DM_NVN_BLIT_ORDER=0: no barriers inside the copy encoder (diagnostic; brings back the fountain's vertical stripes)"); }
     // Only the stages a compute encoder has: MTLStageAll here fails Metal validation (macOS 27: "must be a valid combination of MTLStages for the current encoder type")
     if (!off) [g_blit barrierAfterEncoderStages:MTLStageDispatch | MTLStageBlit beforeEncoderStages:MTLStageDispatch | MTLStageBlit visibilityOptions:blit_vis()];
-    g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_barriers++;
+    g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_barriers++; g_blit_disponly = 1;
 }
 uint64_t mtl_blit_barriers(void) { return g_blit_barriers; }
 static int bw_hit(uint64_t lo, uint64_t hi) { for (int i = 0; i < g_bw_n; i++) if (lo < g_bw_hi[i] && g_bw_lo[i] < hi) return 1; return 0; }
@@ -1672,7 +1674,7 @@ static id<MTL4ComputeCommandEncoder> blit_buf(uint64_t rlo, uint64_t rhi, uint64
     // range-based batching, including separate Metal buffers over one CPU range.
     if (nvn_sparse_alias(rlo, rhi) || nvn_sparse_alias(wlo, whi)) { wlo = 0; whi = ~0ull; }
     if (g_blit_ops && (g_bw_n == BW_MAX || g_br_n == BW_MAX || (rhi > rlo && bw_hit(rlo, rhi)) || bw_hit(wlo, whi) || br_hit(wlo, whi))) blit_barrier();
-    g_bw_lo[g_bw_n] = wlo; g_bw_hi[g_bw_n++] = whi; g_blit_ops++; g_gp_copies++;
+    g_bw_lo[g_bw_n] = wlo; g_bw_hi[g_bw_n++] = whi; g_blit_ops++; g_gp_copies++; g_blit_disponly = 0;
     if (rhi > rlo) { g_br_lo[g_br_n] = rlo; g_br_hi[g_br_n++] = rhi; }
     return e;
 }
@@ -1680,7 +1682,7 @@ static id<MTL4ComputeCommandEncoder> blit_buf(uint64_t rlo, uint64_t rhi, uint64
 static id<MTL4ComputeCommandEncoder> blit(void) {
     id<MTL4ComputeCommandEncoder> e = blit_raw();
     if (g_blit_ops) blit_barrier();
-    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // record as "everything written": the next operation always gets a barrier
+    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1; g_blit_disponly = 0;   // record as "everything written": the next operation always gets a barrier
     return e;
 }
 
@@ -4161,10 +4163,13 @@ static void cpu_unc_take(const tex_t *t) {   // an uncompressed texture is taken
     pthread_mutex_unlock(&g_cpu_tex_mu);
     gws_take(lo, hi);
 }
+static int storage_first_use(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_STORAGE_FIRST_USE"); on = !e || atoi(e) != 0; } return on; }
+// Whether the first use will take the content from the storage when it holds data, as far as registration can tell: a texture whose storage can hold it and that is not of the
+// uncompressed kind, for which the GPU's writes over its storage (gws_owned) may change before then. tex_dirty_upload (hle_nvn.c ft_add) then protects its storage only at that use
+int mtl_tex_first_use_reads(const tex_t *t) { return storage_first_use() && !tex_unc(t) && tex_storage_ok(t, 0); }
 static int tex_cpu_content(const tex_t *t) {
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_STORAGE_FIRST_USE"); on = !e || atoi(e) != 0; }
     int unc = tex_unc(t);
-    if (!on || !tex_storage_ok(t, unc)) return 0;
+    if (!storage_first_use() || !tex_storage_ok(t, unc)) return 0;
     // not over storage the GPU writes (gws_owned: it takes a lock)
     if ((unc && gws_owned((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size)) || !mem_any(t->mem, t->L.size)) return 0;
     if (unc) {
@@ -4363,6 +4368,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     }
     id have = tex_get(t->serial);
     if (!packaged && !have && DM_GAME_TEX_DIRTY_UPLOAD && t->mem && on_sub_thread()) { int nvn_ft_written(const tex_t *); packaged = nvn_ft_written(t); }   // first use of a texture the CPU wrote since init without a flush (hle_nvn.c)
+    else if (!packaged && !have && DM_GAME_TEX_DIRTY_UPLOAD && t->mem) nvn_ft_read(t, 0);   // a first use off the submit thread: one not protected yet is taken from its storage if it holds data, protected otherwise
     if (!packaged && !have && on_sub_thread() && tex_cpu_content(t)) { mtl_tex_cpu_written(t); packaged = 1; }   // storage the CPU wrote before its first use (tex_cpu_content)
     if (!packaged && !have && on_sub_thread() && linear_storage_ok(t)) {   // a linear texture no view on its buffer can take (iOS wants 64-byte rows; Axiom Verge's 8x8 RGBA8 linear textures have 32): uploaded, and again after CPU writes
         uint32_t pf; void *mb; uint64_t mo; size_t row;
@@ -5048,7 +5054,7 @@ static void mirror_readback(const tex_t *t, id<MTLTexture> d, unsigned level, un
 // texture; what the game reads or copies after waiting for the GPU is the drawing. A texture the host uploads from its storage has its own readback (tex_storage_dst, mirror_readback).
 // DM_NVN_GPU_STORAGE=0 turns the stores off (to measure)
 static int mtl_fmt_depth(MTLPixelFormat f); static size_t mtl_pf_block_bytes(MTLPixelFormat pf);
-static id<MTL4ComputeCommandEncoder> dispatch_enc(void); static int rb_copy_shift(const tex_t *t, id<MTLTexture> mt);
+static id<MTL4ComputeCommandEncoder> dispatch_enc(int game); static int rb_copy_shift(const tex_t *t, id<MTLTexture> mt);
 static int rb_swap_gpu(uint64_t src, size_t row, size_t img, uint64_t dst, size_t drow, size_t dimg, size_t wb, size_t rows, size_t nz, int shift);
 static uint64_t g_gsb_stores, g_gsb_bytes;
 void mtl_gsb_stats(uint64_t *n, uint64_t *bytes) { *n = g_gsb_stores; *bytes = g_gsb_bytes; }   // hle_nvn.c's power line
@@ -5088,7 +5094,7 @@ static void gsb_store(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigne
     struct { uint64_t src_off, dst_off, base, pitch, img, layer_stride; uint32_t x0, x1, y0, rows, th, gobs_x, gob2; } *p = (void *)((uint8_t *)qb.contents + qo);
     *p = (typeof(*p)){0, 0, base, pitch, img, L.layer_size, xb0, xb1, (uint32_t)y0, h, th, MAX(nvn_tex_level_gobs(&t->d, level), (row + 63u) >> 6), (uint32_t)nvn_gob_switch2};
     g_wr_epoch++; g_mdx_epoch++; sbw_note((uint64_t)(uintptr_t)t->mem, t->L.size, SBW_GPU);
-    e = dispatch_enc(); enc_c_pso(e, ps);
+    e = dispatch_enc(0); enc_c_pso(e, ps);
     enc_c_args(e, ab.gpuAddress + ao, 0); enc_c_args(e, pg, 1); enc_c_args(e, qb.gpuAddress + qo, 2);
     enc_c_dispatch(e, MTLSizeMake((pitch / 16 + 31) / 32, h, n), MTLSizeMake(32, 1, 1));
     g_gsb_bytes += img * n;
@@ -5650,6 +5656,7 @@ static void shmap_read(void) {
     NSMutableDictionary *geo_mesh;   // a vertex shader's mesh entries by lean kernel key (geo_mesh_fn; NSNull: none)
     uint8_t up_mfx;   // a compute shader that is the game's own upscaler (DM_GAME_UPSCALER_KEYS, from the shader map): 0 not decided, 1 drawn by MetalFX when DM_UPSCALER=metalfx, 2 not one or one its colour keeps (up_mfx_wanted)
     uint8_t up_color;   // such a shader's colour, from its code at load with DM_UPSCALER=metalfx (up_mfx_color; UP_COLOR_UNREAD otherwise)
+    uint8_t up_chain;   // its place in the game's upscaler of several dispatches (DM_GAME_UPSCALER_CHAIN, up_chain_index): 0 not looked up, 1 the first ... n the last, 0xff not in it
     int gs_loc, lay_loc; char gs_comp, lay_comp;   // a slice-writing geometry shader (no function: the layer comes from input gs_loc.gs_comp) / a vertex shader with layer entry points writing output lay_loc.lay_comp (dmsh_build.py gs_slice, vs_layer_entry); -1 = none
     uint64_t cbs_seen; uint32_t cbs_runs;   // the command buffer that listed this shader last, and how many have (cbs_note)
     // The argument buffer encoded last time
@@ -13159,6 +13166,7 @@ static int lc_keeps(uint32_t op) {
 
 static void dispatch(const p_dispatch *dp);
 static int up_mfx_wanted(NvShader *cs); static int up_mfx_encode(NvShader *cs);   // a game's upscaler through MetalFX (see up_mfx_encode)
+static int up_chain_dispatch(NvShader *cs, const p_dispatch *dp);   // a game's upscaler of several dispatches, drawn whole by MetalFX (see up_chain_dispatch)
 static int ndve_engine_dispatch(NvShader *cs, const p_dispatch *dp);   // nn::ndve's movie network as the host's kernels (DM_NDVE_ENGINE=1, nvn_ndve.inc)
 // ---------- Compute dispatches moved ahead of the render pass they would split (DM_NVN_CS_HOIST) ----------
 // Metal cannot run a compute dispatch inside a render pass, so a dispatch between two draws of one pass ends it, and on a tile-based GPU every attachment is stored and loaded again:
@@ -13778,10 +13786,22 @@ static int dispatch_own(void) {
     if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_OWN"); v = (e && !strcmp(e, "1")) || pg_on(); if (v) MLOG("compute dispatches: each in an encoder of its own (DM_NVN_DISPATCH_OWN=1 or DM_NVN_PASSGPU)"); }
     return v;
 }
-static id<MTL4ComputeCommandEncoder> dispatch_enc(void) {
+// The profile's dispatch_overlap (DM_NVN_DISPATCH_OVERLAP overrides it): two of the game's dispatches with nothing between them in the copy encoder and no nvnCommandBufferBarrier of
+// the game's between them run side by side, as NVN lets them: it orders a dispatch after earlier work only through a barrier. A copy, fill or inline update between them, a host
+// dispatch (dispatch_enc's game 0) or a game barrier keeps the barrier, and what comes after a dispatch other than a dispatch still waits for it (everything written). Ocarina of Time
+// runs 117 dispatches at the start of a frame in Kokiri Forest, each waiting for the one before: 5.7 ms; side by side 3.7 ms (Apple M4 Pro, on a fork's oot2 branch)
+static uint64_t g_disp_beside, g_disp_ordered; static int g_disp_last_beside;
+static int dispatch_overlap(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_OVERLAP"); v = e ? atoi(e) != 0 : DM_GAME_DISPATCH_OVERLAP; if (v) MLOG("dispatch overlap: the game's dispatches with no barrier of its between them run side by side (DM_NVN_DISPATCH_OVERLAP=0 orders each after the one before)"); }
+    return v;
+}
+static id<MTL4ComputeCommandEncoder> dispatch_enc(int game) {   // game: one of the game's dispatches (0: the host's own, ordered as a copy is)
     id<MTL4ComputeCommandEncoder> e = blit_open(); g_gp_disp++;
-    if (g_blit_ops) blit_barrier();
-    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // recorded as "everything written": the next copy or dispatch gets a barrier
+    int beside = game && g_blit_ops && g_blit_disponly && !g_cs_gbar && dispatch_overlap();
+    if (g_blit_ops && !beside) blit_barrier();
+    if (game) { g_disp_last_beside = beside; if (beside) g_disp_beside++; else g_disp_ordered++; g_cs_gbar = 0; }
+    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1; g_blit_disponly = game;   // recorded as "everything written": the next copy, or a dispatch after a game barrier, gets a barrier
     if (!g_blit_ct) { [e setArgumentTable:g_ct]; g_blit_ct = 1; }
     args_dirty_all();
     return e;
@@ -13832,6 +13852,7 @@ static void dispatch(const p_dispatch *dp) {
     rp_flush();   // A full clear with no draw after it waits for the next pass on its targets, but it comes before this dispatch, which may read or write them as images: land it first, as copy_t2t does
     image_prepare(prog_get(S.cprog), 0x20);
     if (ndve_engine_dispatch(cs, dp)) return;   // nn::ndve's movie network as the host's kernels (DM_NDVE_ENGINE=1)
+    if (up_chain_dispatch(cs, dp)) return;   // the game's upscaler of several dispatches, drawn whole by MetalFX (DM_UPSCALER=metalfx, profile upscaler_chain)
     if (up_mfx_wanted(cs) && !dp->ind && up_mfx_encode(cs)) return;   // the game's upscaler, drawn by MetalFX instead (DM_UPSCALER=metalfx)
     // Threadgroup memory past Metal's 32 KB, in a device buffer (dmsh_rewrite.py tg_spill): a slice for every workgroup of the grid. An indirect dispatch's grid is in GPU memory, written earlier
     // in the frame: the replay waits for the GPU (as an indirect-count multi-draw does, mdi_wait) and reads it. Mario Kart World's spilled dispatches are all direct, of 1 to 3 workgroups
@@ -13854,7 +13875,7 @@ static void dispatch(const p_dispatch *dp) {
     // or before dispatch_enc's copy-to-dispatch barrier: otherwise the upgrade opens a second encoder, or its copy races the dispatch (#1743).
     encode_args(nil, cs, 5, 0);
     if (own && g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc();
+    id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc(1);
     enc_c_pso(ce, ps);
     if (tg_groups) {
         __strong id<MTLBuffer> tb = nil; size_t to = arena_alloc((size_t)(tg_groups * cs->rf.tg_spill), &tb);
@@ -13891,7 +13912,7 @@ static int rb_swap_gpu(uint64_t src, size_t row, size_t img, uint64_t dst, size_
     id<MTLBuffer> pb; size_t po = arena_alloc(48, &pb);
     struct { uint64_t s, d; uint32_t w, h, row, img, drow, dimg, shift; } *p = (void *)((uint8_t *)pb.contents + po);
     *p = (typeof(*p)){src, dst, (uint32_t)(wb / 2), (uint32_t)rows, (uint32_t)row, (uint32_t)img, (uint32_t)drow, (uint32_t)dimg, (uint32_t)shift};
-    id<MTL4ComputeCommandEncoder> e = dispatch_enc();
+    id<MTL4ComputeCommandEncoder> e = dispatch_enc(0);
     [g_ct setAddress:pb.gpuAddress + po atIndex:0]; enc_c_pso(e, ps);
     enc_c_dispatch(e, MTLSizeMake((wb / 2 + 63) / 64, rows, nz), MTLSizeMake(64, 1, 1));
     static int once; if (!once++) MLOG("RGB565-family copy between guest memory and a host texture: red and blue exchanged on the GPU (first case %zux%zux%zu texels)", wb / 2, rows, nz);
@@ -13957,7 +13978,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
         for (size_t y = 0; y < hb; y++) memcpy(dst + y * row, (const uint8_t *)t->mem + (y0 + y) * srow + x0, wb);
         return;
     }
-    if (tex_from_storage(t) || (DM_GAME_TEX_DIRTY_UPLOAD && t->mem && nvn_ft_written(t))) {
+    if (tex_from_storage(t) || (DM_GAME_TEX_DIRTY_UPLOAD && t->mem && nvn_ft_read(t, 1))) {
         // A sparse pool's texture is read through a copy gathered from its page table, unmapped pages as 0, as pkg_upload_ uploads it: where nothing is mapped its address range is
         // inaccessible (reading the storage directly stopped the host with SIGBUS)
         const uint8_t *mem = t->mem; uint8_t *part = NULL;
@@ -14989,7 +15010,7 @@ void mtl_exec(const uint8_t *p) {
                 PD("I %llu barrier bits %#x%s", g_stat_pass, bits, split ? ": ends the pass (shader writes)" : order ? " (render pass open; a later shader write is ordered after its draws)" : g_enc ? " (render pass open)" : "");
                 if (split) { rp_end(); static int once; if (!once++) MLOG("a game barrier (bits %#x) after shader writes in a draw pass: the pass ends there (first case pass %llu)", bits, (unsigned long long)g_stat_pass); }
                 else if (order) g_pass_order |= (bits & NVN_BARRIER_ORDER_PRIMITIVES_BIT ? 1 : 0) | (bits & (NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT) ? 2 : 0);
-                if (bits) { g_game_barrier = 1; g_fb_bar++; } break; }   // g_fb_bar: snapshots taken before it are stale (see fb_prepare)
+                if (bits) { g_game_barrier = 1; g_fb_bar++; g_cs_gbar = 1; } break; }   // g_fb_bar: snapshots taken before it are stale (see fb_prepare); g_cs_gbar: dispatch_enc
             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: state_op(h.op, a); break;
             default: break;
         }
@@ -15521,7 +15542,8 @@ static int up_mfx_on(void) {
     const char *e = getenv("DM_UPSCALER"); v = e && !strcmp(e, "metalfx");
     if (e && *e && strcmp(e, "metalfx") && strcmp(e, "game")) MLOG("[RED] DM_UPSCALER=%s: metalfx or game; keeping the game's", e);
     if (v && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) { MLOG("upscaler: this GPU has no Metal 4 MetalFX spatial scaler; the game's own upscaler draws"); v = 0; }
-    if (v) MLOG("upscaler (DM_UPSCALER): metalfx, the game's upscaler shaders (%d, from the shader map) are drawn by MetalFX's spatial scaler", DM_GAME_UPSCALER_N);
+    if (v) MLOG("upscaler (DM_UPSCALER): metalfx, the game's upscaler shaders (%d, from the shader map%s) are drawn by MetalFX's spatial scaler", DM_GAME_UPSCALER_N,
+                DM_GAME_UPSCALER_CHAIN_N ? ", and the profile's upscaler chain" : "");
     return v;
 }
 // The colour a variant of the network takes and writes, from the sRGB curves in its code (their constants are immediates, whole bytes in the code). The variants differ inside a pack, so this is the shader's and not the game's:
@@ -15572,7 +15594,7 @@ static up_mfx_scaler *up_mfx_scaler_for(NSUInteger iw, NSUInteger ih, NSUInteger
     NSError *err = nil; uint64_t t0 = now_ns();
     if (!g_fx_comp) g_fx_comp = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&err];
     MTLFXSpatialScalerDescriptor *d = [MTLFXSpatialScalerDescriptor new];
-    MTLPixelFormat of = srgb ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatRGBA16Float;   // sRGB input's result stays encoded, in 0-1 as the network clamps it, and an sRGB view of it decodes it for the draw into the game's image
+    MTLPixelFormat of = srgb == 1 ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatRGBA16Float;   // sRGB input's result stays encoded, in 0-1 as the network clamps it, and an sRGB view of it decodes it for the draw into the game's image; srgb 2 (encoded in and out): RGBA16F, drawn as it is
     d.colorTextureFormat = MTLPixelFormatRGBA16Float; d.outputTextureFormat = of; d.inputWidth = iw; d.inputHeight = ih; d.outputWidth = ow; d.outputHeight = oh;
     d.colorProcessingMode = srgb ? MTLFXSpatialScalerColorProcessingModePerceptual : MTLFXSpatialScalerColorProcessingModeHDR;
     id<MTL4FXSpatialScaler> sc = g_fx_comp ? [d newSpatialScalerWithDevice:g_dev compiler:g_fx_comp] : nil;
@@ -15580,8 +15602,8 @@ static up_mfx_scaler *up_mfx_scaler_for(NSUInteger iw, NSUInteger ih, NSUInteger
     if (sc) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:iw height:ih mipmapped:NO];
         td.storageMode = MTLStorageModePrivate; td.usage = sc.colorTextureUsage | MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; in = [g_dev newTextureWithDescriptor:td];
-        td.pixelFormat = of; td.width = ow; td.height = oh; td.usage = sc.outputTextureUsage | MTLTextureUsageShaderRead | (srgb ? MTLTextureUsagePixelFormatView : 0); out = [g_dev newTextureWithDescriptor:td];
-        read = srgb ? [out newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB] : out;
+        td.pixelFormat = of; td.width = ow; td.height = oh; td.usage = sc.outputTextureUsage | MTLTextureUsageShaderRead | (srgb == 1 ? MTLTextureUsagePixelFormatView : 0); out = [g_dev newTextureWithDescriptor:td];
+        read = srgb == 1 ? [out newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB] : out;
     }
     MLOG("%supscaler: MetalFX spatial scaler (%s) %lux%lu → %lux%lu%s, %.1f ms", sc && in && read ? "" : "[RED] ", srgb ? "perceptual" : "HDR", (unsigned long)iw, (unsigned long)ih, (unsigned long)ow, (unsigned long)oh,
          sc && in && read ? "" : ": MetalFX made none; the game's upscaler draws this size", (now_ns() - t0) / 1e6);
@@ -15597,6 +15619,7 @@ static int up_mfx_rect(const uint32_t v[4], NSUInteger w, NSUInteger h, NVNcopyR
     *r = (NVNcopyRegion){(int)v[0], (int)v[1], 0, (int)rw, (int)rh, 1}; return 1;
 }
 // The dispatch of upscaler cs as MetalFX's spatial scaler from its texture slot's rectangle to its image slot's (see above): 1 when drawn, 0 to run the shader
+static int up_mfx_run(id<MTLTexture> in, id<MTLTexture> out, uint64_t dserial, NVNcopyRegion ir, NVNcopyRegion orr, int srgb, const char *key);
 static int up_mfx_encode(NvShader *cs) {
     int ti = -1, oi = -1;
     for (int i = 0; i < cs->rf.nb; i++) { int k = cs->rf.b[i].kind; if (k == NVN_RB_TEX && ti < 0) ti = i; else if (k == NVN_RB_IMG && oi < 0) oi = i; else if (k == NVN_RB_TEX || k == NVN_RB_IMG) return 0; }
@@ -15618,20 +15641,25 @@ static int up_mfx_encode(NvShader *cs) {
     if (!in || !out || in == out || in.textureType != MTLTextureType2D || out.textureType != MTLTextureType2D || in.sampleCount != 1 || out.sampleCount != 1 ||
         fmt_int_or_ds(in.pixelFormat) || fmt_int_or_ds(out.pixelFormat) || mtl_fmt_block(out.pixelFormat) || !up_mfx_rect(v, in.width, in.height, &ir) || !up_mfx_rect(v + 4, out.width, out.height, &orr) ||
         orr.width < ir.width || orr.height < ir.height || (orr.width == ir.width && orr.height == ir.height)) { g_up_mfx_kept++; return 0; }
-    int srgb = cs->up_color == UP_COLOR_SRGB;
-    up_mfx_scaler *e = up_mfx_scaler_for((NSUInteger)ir.width, (NSUInteger)ir.height, (NSUInteger)orr.width, (NSUInteger)orr.height, srgb); if (!e) { g_up_mfx_kept++; return 0; }
+    if (!up_mfx_run(in, out, dout.serial, ir, orr, cs->up_color == UP_COLOR_SRGB, cs->key)) { g_up_mfx_kept++; return 0; }
+    return 1;
+}
+// in's rectangle ir scaled by MetalFX's spatial scaler into out's rectangle orr (dserial: out's serial). srgb 0: linear colour, HDR mode; 1: sRGB-encoded input decoded into out
+// (perceptual); 2: encoded input that stays encoded (perceptual, the result drawn as it is: a movie's picture). 1 when drawn, 0 when nothing reached out (the caller's shaders can still run)
+static int up_mfx_run(id<MTLTexture> in, id<MTLTexture> out, uint64_t dserial, NVNcopyRegion ir, NVNcopyRegion orr, int srgb, const char *key) {
+    up_mfx_scaler *e = up_mfx_scaler_for((NSUInteger)ir.width, (NSUInteger)ir.height, (NSUInteger)orr.width, (NSUInteger)orr.height, srgb); if (!e) return 0;
     id<MTL4FXSpatialScaler> sc = e->sc;
     // Straight in and out when MetalFX can take the game's textures as they are; through the scaler's own textures otherwise
     int direct = !srgb && (NSUInteger)ir.width == in.width && (NSUInteger)ir.height == in.height && out.storageMode == MTLStorageModePrivate &&
                  in.pixelFormat == MTLPixelFormatRGBA16Float && out.pixelFormat == MTLPixelFormatRGBA16Float && !ir.xoffset && !ir.yoffset && !orr.xoffset && !orr.yoffset && (NSUInteger)orr.width == out.width &&
                  (NSUInteger)orr.height == out.height && (in.usage & sc.colorTextureUsage) == sc.colorTextureUsage && (out.usage & sc.outputTextureUsage) == sc.outputTextureUsage;
-    if (!direct && !(out.usage & MTLTextureUsageRenderTarget)) { g_up_mfx_kept++; return 0; }
-    zskip_del(dout.serial);
+    if (!direct && !(out.usage & MTLTextureUsageRenderTarget)) return 0;
+    zskip_del(dserial);
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     ubd_land_compute();
     NVNcopyRegion at0 = {0, 0, 0, ir.width, ir.height, 1}, at0o = {0, 0, 0, orr.width, orr.height, 1};
     id<MTLTexture> color = direct ? in : e->in, result = direct ? out : e->out;
-    if (!direct && !copy_t2t_draw(in, color, 0, 0, 0, 0, &ir, &at0, 0, 0)) { g_up_mfx_kept++; return 0; }   // into RGBA16F at the origin (a nearest draw: same size)
+    if (!direct && !copy_t2t_draw(in, color, 0, 0, 0, 0, &ir, &at0, 0, 0)) return 0;   // into RGBA16F at the origin (a nearest draw: same size)
     id<MTL4ComputeCommandEncoder> ce = [g_cb computeCommandEncoder];   // as dlss_eval: MetalFX opens encoders of its own, which take no barrier
     [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];
     [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];
@@ -15643,12 +15671,78 @@ static int up_mfx_encode(NvShader *cs) {
     });
     g_last_end_relaxed = 0;   // the next pass waits for the scaler whole (enc_r_begin_pass)
     if (!direct && !copy_t2t_draw(e->read, out, 0, 0, 0, 0, &at0o, &orr, 0, 0)) {
-        args_dirty_all(); g_up_mfx_kept++; return 0;   // only the scratch image was scaled; the game's shader can still produce the output
+        args_dirty_all(); return 0;   // only the scratch image was scaled; the game's shader can still produce the output
     }
     args_dirty_all();
-    if (!g_up_mfx_n++) MLOG("upscaler: first dispatch of %s drawn by MetalFX, %dx%d at %d,%d of %lux%lu (format %lu) → %dx%d at %d,%d of %lux%lu (format %lu)%s", cs->key, ir.width, ir.height, ir.xoffset, ir.yoffset,
+    if (!g_up_mfx_n++) MLOG("upscaler: first dispatch of %s drawn by MetalFX, %dx%d at %d,%d of %lux%lu (format %lu) → %dx%d at %d,%d of %lux%lu (format %lu)%s", key, ir.width, ir.height, ir.xoffset, ir.yoffset,
                             (unsigned long)in.width, (unsigned long)in.height, (unsigned long)in.pixelFormat, orr.width, orr.height, orr.xoffset, orr.yoffset, (unsigned long)out.width, (unsigned long)out.height,
-                            (unsigned long)out.pixelFormat, direct ? ", straight" : srgb ? ", through RGBA16F, decoded from sRGB" : ", through RGBA16F");
+                            (unsigned long)out.pixelFormat, direct ? ", straight" : srgb == 1 ? ", through RGBA16F, decoded from sRGB" : srgb ? ", through RGBA16F, perceptual, kept encoded" : ", through RGBA16F");
+    return 1;
+}
+// ---------- A game's upscaler of several dispatches, drawn whole by MetalFX (DM_UPSCALER=metalfx, profile upscaler_chain) ----------
+// Ocarina of Time (Switch 2) upscales its frame with another shape of agl's NDSR than up_mfx_encode's single dispatch (agl_ndsr_vr.pck and agl_ndsr_vr_light.pck, not agl_ndsr.pck): four
+// compute dispatches a frame, f8965bff (a tile list; its one texture is the scene colour, R11G11B10F, drawn just before), d17eefaf (indirect; edge bits ORed into an R32 view of an RGBA8
+// texture), a335c1db (packs colour and edges) and the HMMA network (its one image is the output, which the UI is drawn over), a variant for each scale: fa3033d0 at 1440x810 → 1920x1080,
+// then aad7ea7e, b106afba, 04135bb8 and 7c511cc2 as the dynamic resolution steps down to 640x360 (traced at each level). The profile's upscaler_chain names such a chain in order
+// (DM_GAME_UPSCALER_CHAIN), each place a key, the last one also * : the dispatch right after the others, whatever its key. With DM_UPSCALER=metalfx (the launcher's Game's upscaler: MetalFX)
+// the first dispatch is skipped and its texture kept, the ones after it are skipped in their order, and at the last MetalFX's spatial scaler scales that whole texture into the last one's whole
+// image, as linear colour (HDR mode). Ocarina's dynamic resolution gives its colour target the size it renders at, so the whole texture is the frame. On an M2 at 854x480 in handheld mode the network took about 6 ms a frame and MetalFX 2.9 (from the oot2 branch's NDSR replacement, after
+// Peak8D's oot-full-build). Anything unexpected (the first dispatch's texture, the last one's image, a dispatch of the chain out of its order, a chain that did not reach its last dispatch,
+// MetalFX refusing) runs the game's chain from then on, with a red line; the frame it happens in runs the network on what the skipped dispatches left. An indirect first dispatch runs the game's chain for that frame
+static int g_up_chain_armed, g_up_chain_next, g_up_chain_failed; static id<MTLTexture> g_up_chain_in; static uint64_t g_up_chain_n;   // next: the place the next dispatch of the chain takes
+// cs's place in the chain by its key: 0 the first ... DM_GAME_UPSCALER_CHAIN_N - 1 the last; -1 not named (a last place of * names no key)
+static int up_chain_index(NvShader *cs) {
+    if (!cs->up_chain) {
+        cs->up_chain = 0xff; int i = 0;
+        for (const char *k = DM_GAME_UPSCALER_CHAIN; *k; i++) {
+            if (*k != '*' && !strncmp(k, cs->key, 16)) { cs->up_chain = (uint8_t)(i + 1); break; }
+            k += *k == '*' ? 1 : 16; if (*k == ',') k++;
+        }
+    }
+    return cs->up_chain != 0xff ? cs->up_chain - 1 : -1;
+}
+static int up_chain_any_last(void) { const char *c = DM_GAME_UPSCALER_CHAIN; size_t n = strlen(c); return n && c[n - 1] == '*'; }
+// The one binding of kind k in cs (-1: none or several)
+static int up_chain_bind(NvShader *cs, int k) {
+    int r = -1;
+    for (int i = 0; i < cs->rf.nb; i++) if (cs->rf.b[i].kind == k) { if (r >= 0) return -1; r = i; }
+    return r;
+}
+static int up_chain_fail(const char *why, NvShader *cs) { MLOG("[RED] upscaler chain: %s (%s); the game's dispatches run from the next frame", why, cs->key); g_up_chain_failed = 1; g_up_chain_armed = 0; g_up_chain_in = nil; return 0; }
+// 1 when dispatch dp of cs is taken (skipped, or the chain drawn by MetalFX), 0 to run it
+static int up_chain_dispatch(NvShader *cs, const p_dispatch *dp) {
+    if (!DM_GAME_UPSCALER_CHAIN_N || g_up_chain_failed || !up_mfx_on()) return 0;
+    int last = DM_GAME_UPSCALER_CHAIN_N - 1, i = up_chain_index(cs);
+    if (i < 0 && g_up_chain_armed && g_up_chain_next == last && up_chain_any_last()) i = last;   // the dispatch right after the named ones, whatever its key
+    if (i < 0) return 0;
+    if (i == 0) {
+        if (g_up_chain_armed) return up_chain_fail("the chain before did not reach its last dispatch", cs);
+        if (dp->ind) return 0;
+        int ti = up_chain_bind(cs, NVN_RB_TEX); if (ti < 0) return up_chain_fail("the first dispatch has not one texture", cs);
+        int tin = (int)(tex_slot_h(S.tex[5], S.img[5], cs->rf.b[ti].reg) & 0xfffff);
+        os_unfair_lock_lock(&g_rmu);
+        id<MTLTexture> in = tin > 0 && tin < g_ntreg && g_treg[tin].ok ? tex_by_id(tin) : nil;
+        os_unfair_lock_unlock(&g_rmu);
+        if (!in || in.textureType != MTLTextureType2D || in.sampleCount != 1 || fmt_int_or_ds(in.pixelFormat)) return up_chain_fail("the colour texture is not a single-sampled 2D colour texture", cs);
+        g_up_chain_in = in; g_up_chain_armed = 1; g_up_chain_next = 1;
+        return 1;
+    }
+    if (!g_up_chain_armed) return 0;
+    if (i != g_up_chain_next) return up_chain_fail("a dispatch of the chain out of its order", cs);
+    if (i < last) { g_up_chain_next++; return 1; }
+    id<MTLTexture> in = g_up_chain_in; g_up_chain_armed = 0; g_up_chain_in = nil;
+    int oi = up_chain_bind(cs, NVN_RB_IMG); if (oi < 0 || cs->rf.b[oi].reg >= 32) return up_chain_fail("the last dispatch has not one image", cs);
+    int tout = (int)(S.img[5][cs->rf.b[oi].reg] & 0xfffff);
+    tex_t dout = {0}; uint64_t rid = 0; int real = 0; id<MTLTexture> out = nil;
+    os_unfair_lock_lock(&g_rmu);
+    if (tout > 0 && tout < g_ntreg && g_treg[tout].ok) { dout = g_treg[tout].t; out = img_binding(tout, &cs->rf.b[oi], &rid, &real); if (!real) out = nil; }
+    os_unfair_lock_unlock(&g_rmu);
+    if (!out || out == in || out.textureType != MTLTextureType2D || out.sampleCount != 1 || fmt_int_or_ds(out.pixelFormat) || mtl_fmt_block(out.pixelFormat) || out.width < in.width || out.height < in.height ||
+        (out.width == in.width && out.height == in.height)) return up_chain_fail("the output image is not a larger 2D colour image", cs);
+    NVNcopyRegion ir = {0, 0, 0, (int)in.width, (int)in.height, 1}, orr = {0, 0, 0, (int)out.width, (int)out.height, 1};
+    if (!up_mfx_run(in, out, dout.serial, ir, orr, 0, cs->key)) return up_chain_fail("MetalFX did not draw it", cs);
+    if (!g_up_chain_n++) MLOG("upscaler chain: first frame drawn by MetalFX (%d dispatches), %lux%lu (format %lu) → %lux%lu (format %lu)", DM_GAME_UPSCALER_CHAIN_N, (unsigned long)in.width,
+                              (unsigned long)in.height, (unsigned long)in.pixelFormat, (unsigned long)out.width, (unsigned long)out.height, (unsigned long)out.pixelFormat);
     return 1;
 }
 // The present pass: src's valid rectangle drawn into dst (the drawable, or a screenshot's texture) as present_encode draws it, through MetalFX first where fx_encode takes it
