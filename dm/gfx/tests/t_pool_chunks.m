@@ -129,6 +129,15 @@ int main(void) { @autoreleasepool {
     CHECK("the table holds it now", tab[7] != none && tab[8] == none);
     words[2] = 8u | 3u << 20; CHECK("once a frame", !pool_scan_bound(0));
     atomic_fetch_add(&g_cur_frame, 1); CHECK("the next frame reads it again", pool_scan_bound(0) && tex_get(unnamed.serial) != NULL);
+    // Two buffers of one size 4 KB apart, bound together: each is read once a frame (a table indexed by bits that left out 12 to 15 put them in one slot, and each draw read both again)
+    atomic_fetch_add(&g_cur_frame, 1);
+    uint32_t *w2 = words + 1024; memset(w2, 0, 16);
+    S.ssbo[0][2] = (p_bind_buf){0, 1, (uint64_t)(uintptr_t)w2, 16};
+    uint64_t sc0 = g_pscan_n; (void)pool_scan_bound(0); uint64_t sc1 = g_pscan_n; (void)pool_scan_bound(0); (void)pool_scan_bound(0);
+    CHECK("two buffers 4 KB apart: each read once a frame", sc1 - sc0 == 2 && g_pscan_n == sc1);
+    atomic_fetch_add(&g_cur_frame, 1); (void)pool_scan_bound(0);
+    CHECK("and both again the next frame", g_pscan_n == sc1 + 2);
+    S.ssbo[0][2] = (p_bind_buf){0};
     finish();
     S.ssbo[0][1] = (p_bind_buf){0};
     mtl_reg_tex(7, NULL, NULL); mtl_reg_tex(8, NULL, NULL); mtl_reg_tex(9, NULL, NULL); mtl_tex_release(&named); mtl_tex_release(&unnamed); g_pool_sparse = 0; g_pool_walked = 0;

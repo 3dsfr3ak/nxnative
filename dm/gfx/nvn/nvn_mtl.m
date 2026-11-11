@@ -8196,21 +8196,35 @@ static int ubo_samp_id(uint32_t h) { int s = (int)(h >> 20); return s ? s + S.sa
 // A handle such a shader computes comes from memory it reads, and its buffers are bound (the 550 AnnaSurface pixel shaders of Nintendo Switch Sports Resort index a table of handles in a storage buffer by a
 // value from a uniform one). So a word of a bound buffer that reads as a handle, a registered texture and a registered sampler, gets its texture. Wider than the draw needs: every texture its table lists,
 // and now and then a value that only looks like one, which costs a texture and nothing else. A handle put together in the shader, or read through a pointer, is not seen, and its draw reads the dummy.
-// Each buffer once a frame, the head of a very large one. Caller holds g_rmu. Returns whether it made a texture
-enum { POOL_SCAN_SEEN = 256, POOL_SCAN_MAX = 4u << 20 };
+// Each buffer once a frame, the head of a very large one: the frame's buffers are kept by address and size in an open-addressed table, so two that hash alike are both kept. A table that kept
+// one buffer a slot, indexed by (addr >> 4) ^ (addr >> 16) ^ size modulo 256, put buffers 4 KB apart in one 64 KB window in the same slot (address bits 12 to 15 did not count): bound
+// together, each draw scanned both again (Nintendo Switch Sports Resort in two-player play: 96% of the submit thread's samples, about 1.7 million instructions a draw, 13 fps).
+// Caller holds g_rmu. Returns whether it made a texture
+enum { POOL_SCAN_SEEN = 4096, POOL_SCAN_PROBE = 16, POOL_SCAN_MAX = 4u << 20 };
+static uint64_t g_pscan_n, g_pscan_bytes;   // buffers scanned and bytes read (the log line below; t_pool_chunks)
 static int pool_scan_bound(int stage) {
-    static struct { uint64_t addr, frame; uint32_t size; } seen[POOL_SCAN_SEEN];
-    static uint64_t made, bytes, scanned;
+    static struct { uint64_t addr, frame; uint32_t size; } seen[POOL_SCAN_SEEN];   // size 0: an empty slot
+    static uint64_t made, bytes, scanned, log_frame, log_n, log_bytes;
     uint64_t frame = atomic_load(&g_cur_frame); int any = 0;
+    if (frame >= log_frame + 600) {   // what the scans cost, every 600 frames that had any
+        if (g_pscan_n != log_n) MLOG("pool for handles traced to no slot: bound buffers scanned %llu times in frames %llu to %llu (%.1f a frame), %.1f MB read", (unsigned long long)(g_pscan_n - log_n),
+                                     (unsigned long long)log_frame, (unsigned long long)frame, (double)(g_pscan_n - log_n) / (double)(frame - log_frame), (double)(g_pscan_bytes - log_bytes) / 1048576.0);
+        log_frame = frame; log_n = g_pscan_n; log_bytes = g_pscan_bytes;
+    }
     for (int kind = 0; kind < 2; kind++) for (int r = 0; r < 16; r++) {
         const p_bind_buf *u = kind ? &S.ssbo[stage][r] : &S.ubo[stage][r];
         uint32_t size = (uint32_t)MIN(u->size, (uint64_t)POOL_SCAN_MAX) & ~3u;
         if (!u->addr || !size) continue;
-        unsigned h = (unsigned)((u->addr >> 4) ^ (u->addr >> 16) ^ size) % POOL_SCAN_SEEN;
-        if (seen[h].addr == u->addr && seen[h].size == size && seen[h].frame == frame) continue;
-        seen[h].addr = u->addr; seen[h].size = size; seen[h].frame = frame;
+        unsigned j = (unsigned)(((u->addr ^ (uint64_t)size << 40) * 0x9E3779B97F4A7C15ull) >> 52);   // 12 bits of a multiplicative hash: every address bit counts
+        int dup = 0;
+        for (int k = 0; k < POOL_SCAN_PROBE; k++, j = (j + 1) & (POOL_SCAN_SEEN - 1)) {
+            if (!seen[j].size || seen[j].frame != frame) break;   // free this frame: the buffer is not in the table yet
+            if (seen[j].addr == u->addr && seen[j].size == size) { dup = 1; break; }
+        }
+        if (dup) continue;
+        seen[j].addr = u->addr; seen[j].size = size; seen[j].frame = frame;   // the first free slot, or after a full run the one past it (a buffer there may be read again)
         if (!pool_holds(u->addr, size)) continue;
-        const uint32_t *w = (const uint32_t *)(uintptr_t)u->addr; scanned += size;
+        const uint32_t *w = (const uint32_t *)(uintptr_t)u->addr; scanned += size; g_pscan_n++; g_pscan_bytes += size;
         // Most words are numbers: the sampler rejects a float, and neither table moves here (g_rmu is held)
         const int tb = S.tex_base, sb = S.samp_base, nt = g_ntreg, ns = g_nsreg; const uint8_t *sok = g_sreg_ok; const treg_t *tr = g_treg;
         for (uint32_t i = 0; i < size / 4; i++) {

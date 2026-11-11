@@ -1249,6 +1249,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md): about 3 walks a frame of 33,024 IDs, each about 3.7 ms and a new 264 KB buffer. `pool_gpu` went from 43.5% to 1.1% of the Presentation Thread, and the thread from 27% to 14% of a core.
 - **Check:** `t_pool_table`.
 
+### Bound buffers scanned again at every draw
+
+- **Symptom:** past the [budget](#a-texture-table-past-its-memory-budget), the thread that encodes spends nearly all its time in `pool_scan_bound` (Time Profiler, under `pool_holds` and `encode_args_`), and the `translation up to frame` line counts a million instructions or more per draw where a few tens of thousands are usual.
+- **Cause:** the scan keeps the buffers it read this frame so that each is read once a frame. It kept them in 256 slots, one buffer a slot, indexed by `(addr >> 4) ^ (addr >> 16) ^ size` modulo 256. That index leaves out address bits 12 to 15, so two buffers of one size 4 KB apart in one 64 KB window share a slot. Bound to the same draw, each evicted the other, and both were read again at every draw.
+- **Fix:** `nvn_mtl.m`, for every game past the budget. The frame's buffers are kept by address and size in an open-addressed table of 4,096 slots with a multiplicative hash of every address bit, so two that hash alike are both kept. A line every 600 frames counts the scans and the bytes read.
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md#two-player-play) in two-player golf: 96% of the submit thread's samples, about 1.7 million instructions a draw, 13 fps. After it about 30,000 to 77,000 instructions a draw and 27 to 41 fps, with about 190 to 300 scans and 3 MB read a frame.
+- **Check:** `t_pool_chunks` (two buffers 4 KB apart, each read once a frame and both again the next).
+
 ### An array of handles in a uniform buffer
 
 - **Symptom:** the host stops at the shader's first load: `unexpected argument buffer layout: encodedLength=640 maxAid=48`.
