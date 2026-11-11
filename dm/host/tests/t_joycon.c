@@ -1,4 +1,4 @@
-// A right Joy-Con's raw reports (joycon.h): buttons, the stick and its calibration, the IMU's frame and scales, the setup sequence.
+// A Joy-Con's raw reports (joycon.h), right and left: buttons, the stick and its calibration, the IMU's frame and scales, the setup sequence.
 #include <stdio.h>
 #include "../joycon.h"
 
@@ -101,6 +101,36 @@ int main(void) {
     // No answer at all: every step skipped reaches the end with the nominal scales
     jc_init_start(&s); int steps = 0; while (s.step != JC_DONE && steps++ < 20) jc_init_skip(&s);
     CHECK(s.step == JC_DONE && steps < 20 && s.cal.acc_scale[0] == JC_ACC_SCALE && s.cal.gyro_scale[2] == JC_GYRO_SCALE);
+
+    // A left Joy-Con: its own buttons byte and stick, the Pro Controller's axes, its stick's calibration at its own addresses and in its own order
+    full(r, 2048, 2048); put12(r + 6, 2048, 2048); r[5] = 0x01; CHECK(jc_decode_side(&c, r, 49, &in, 1) && in.buttons == DM_BTN_DOWN);
+    r[5] = 0x02; jc_decode_side(&c, r, 49, &in, 1); CHECK(in.buttons == DM_BTN_UP);
+    r[5] = 0x04; jc_decode_side(&c, r, 49, &in, 1); CHECK(in.buttons == DM_BTN_RIGHT);
+    r[5] = 0x08; jc_decode_side(&c, r, 49, &in, 1); CHECK(in.buttons == DM_BTN_LEFT);
+    r[5] = 0xc0; r[4] = 0x09; jc_decode_side(&c, r, 49, &in, 1); CHECK(in.buttons == (DM_BTN_L | DM_BTN_ZL | DM_BTN_MINUS | DM_BTN_LS));
+    r[5] = 0x30; r[4] = 0x20; jc_decode_side(&c, r, 49, &in, 1); CHECK(in.buttons == 0);   // SL, SR and Capture: nothing of the game's
+    r[5] = 0; r[4] = 0; r[3] = 0xff; jc_decode_side(&c, r, 49, &in, 1); CHECK(in.buttons == 0);   // the right Joy-Con's byte: not this controller's
+    full(r, 2048, 2048); put12(r + 6, 2048 + 700, 2048 - 1400); put12(r + 9, 0, 0);
+    jc_decode_side(&c, r, 49, &in, 1); CHECK(near(in.stick[0], .5f) && near(in.stick[1], -1));   // the left stick, not the right one's bytes
+    full(r, 2048, 2048); for (int s = 0; s < 3; s++) put16(r + 13 + 12 * s + 4, 4096);   // raw z of a left Joy-Con face up: the Pro Controller's sign
+    jc_decode_side(&c, r, 49, &in, 1); CHECK(in.samples == 3 && near(in.acc[0][0], 0) && near(in.acc[0][1], 0) && near(in.acc[0][2], -1));
+    full(r, 2048, 2048); put16(r + 13, 4096); put16(r + 15, 2048); put16(r + 17, 1024);   // acc = (raw1, -raw0, -raw2)
+    jc_decode_side(&c, r, 49, &in, 1); CHECK(near(in.acc[0][0], .5f) && near(in.acc[0][1], -1) && near(in.acc[0][2], -.25f));
+    full(r, 2048, 2048); put16(r + 19, 1000); put16(r + 21, 2000); put16(r + 23, 3000);   // rot = (-raw4, raw3, raw5)
+    jc_decode_side(&c, r, 49, &in, 1); CHECK(near(in.rot[0][0], -2000 * dps) && near(in.rot[0][1], 1000 * dps) && near(in.rot[0][2], 3000 * dps));
+    put12(st, 500, 400); put12(st + 3, 2000, 1900); put12(st + 6, 1000, 800);   // reach above, rest, reach below
+    jc_cal_defaults(&k); jc_cal_stick_side(&k, st, 1);
+    CHECK(k.center[0] == 2000 && k.center[1] == 1900 && k.lo[0] == 1000 && k.lo[1] == 800 && k.hi[0] == 500 && k.hi[1] == 400);
+    jc_init_start_side(&s, 1);
+    CHECK(jc_init_command(&s, 0, cmd) == 6 && cmd[1] == 0x10 && cmd[2] == 0x80 && cmd[5] == 2);   // the left stick's user magic
+    n = spi_reply(r, &s, blank); CHECK(jc_init_reply(&s, r, n) && s.step == JC_STICK_FACTORY);
+    jc_init_command(&s, 0, cmd); CHECK(cmd[1] == 0x3D && cmd[2] == 0x60 && cmd[5] == 9);
+    put12(stick, 1300, 1400); put12(stick + 3, 2100, 1950); put12(stick + 6, 1100, 1200);
+    n = spi_reply(r, &s, stick); CHECK(jc_init_reply(&s, r, n) && s.step == JC_IMU_MAGIC && s.cal.center[0] == 2100 && s.cal.lo[1] == 1200 && s.cal.hi[0] == 1300);
+    jc_init_start_side(&s, 1); n = spi_reply(r, &s, magic); CHECK(jc_init_reply(&s, r, n) && s.step == JC_STICK_USER);
+    jc_init_command(&s, 0, cmd); CHECK(cmd[1] == 0x12 && cmd[2] == 0x80 && cmd[5] == 9);
+    n = spi_reply(r, &s, stick); CHECK(jc_init_reply(&s, r, n) && s.step == JC_IMU_MAGIC);
+    jc_init_command(&s, 0, cmd); CHECK(cmd[1] == 0x26 && cmd[2] == 0x80 && cmd[5] == 2);   // the IMU's calibration: the same addresses as the right one's
 
     // The output report
     uint8_t out[JC_OUTPUT_LEN]; uint8_t sub[2] = {0x40, 1}; jc_packet(out, 0x13, sub, 2);

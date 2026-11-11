@@ -53,12 +53,13 @@ Open. Golf on a 16 GB M2 MacBook Air, Docked: about 27 fps at its usual 28 to 35
 ## Two-player play
 
 - **The submit thread rescanned bound buffers on every draw:** two-player golf (not split screen) ran at 12.6 to 15 fps against 30 in one-player, with the host translating 1.2 to 1.7 million instructions per draw, 33 to 78 ms a frame, against about 30,000. Time Profiler put 96% of the submit thread in `pool_scan_bound`. Fixed in the host ([Bound buffers scanned again at every draw](../../../docs/reference/shaders.md#bound-buffers-scanned-again-at-every-draw)): about 30,000 to 77,000 instructions per draw, 3 to 5 ms a frame, 27 to 41 fps; about 190 to 300 buffer scans a frame, about 3 MB read. The GPU is the limit after it, 30 to 57 ms a frame in the heavy stretches.
+- **Two Joy-Cons, a right and a left:** macOS merges them into one "Joy-Con (L/R)" controller with no motion, made of the same right Joy-Con that played player 1 over raw HID, so player 2 had the left Joy-Con with the right one's buttons and no swing. Each is now read over raw HID as a player of its own with its motion ([A left Joy-Con as a player of its own](../../../docs/reference/services.md#a-left-joy-con-as-a-player-of-its-own)). The game reads player 2's swing from the left half of the pair; checked by the player in two-player play (2026-11-11). Player 2's left Joy-Con has no A, B, X or Y, so player 1 takes the menus.
 
 ## Other open items
 
 - Shaders `a77a3a7b19f29a89` and `c7772ae369ee1c0e` are missing from the shader map, and one mesh draw is skipped.
 - The VP9 decoder refuses packets with 12 pictures waiting for a released buffer.
-- A right Joy-Con's SL and SR buttons, Home and Capture reach nothing, and it has no rumble. A left Joy-Con is not read.
+- A Joy-Con's SL and SR buttons, Home and Capture reach nothing, and it has no rumble. Two Joy-Cons as one player (DM_PAD_MERGE) share one motion source.
 - The sensor's specifications other than its ranges are answered as 0, values unknown.
 - Joy-Con icon colours use an inferred layout.
 - 10 shaders do not translate, most of them mesh shaders (`ISBERD mode b8`), the others Ampere instructions 481 and 243, and 3 mesh stages are left out. Whether a scene needs them is not known.
@@ -87,6 +88,7 @@ Value `0xd142ed7d` is a table of registered account IDs. A save from elsewhere h
 - [Output streams](../../../docs/reference/audio.md#output-streams-sdk-22): the menu movie's sound.
 - [SensorFusion and NpadImu](../../../docs/reference/services.md#sensorfusion-and-npadimu-switch-2-sdks) and [a lone right Joy-Con on the Mac](../../../docs/reference/services.md#a-lone-right-joy-con-on-the-mac).
 - [Bound buffers scanned again at every draw](../../../docs/reference/shaders.md#bound-buffers-scanned-again-at-every-draw): two-player golf at 13 fps (Two-player play above).
+- [A left Joy-Con as a player of its own](../../../docs/reference/services.md#a-left-joy-con-as-a-player-of-its-own): player 2 swings with a left Joy-Con.
 - [A Joy-Con that does nothing in handheld mode](../../../docs/reference/services.md#a-joy-con-that-does-nothing-in-handheld-mode): the game opened its controller applet 295 times in under a minute. With the fix it opened none, and the right Joy-Con worked in Console mode Handheld, started from a Mac app's settings window (one short run, reported by the player).
 - Host calls first needed here: `nn::fs::MountRamDisk`, the game's own save mounted read-only, Home button protection, `GetJcmsState`, Joy-Con icon colours, and virtual output devices.
 - The game supports only handheld and dual Joy-Con styles (`0x6`). Offering full key looped its controller applet, so `style_for_player` follows the supported set.

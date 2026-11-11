@@ -1,10 +1,14 @@
-// A right Joy-Con over Bluetooth, read as raw HID (joycon_mac.h). GameController lists one with no extended gamepad profile, so front_mac.m has no buttons or stick from it, and macOS's
-// GCMotion is zero-only on the Pro Controller (motion_pro.h). Pure, so tests/t_joycon.c checks it without a controller.
-// Protocol: dekuNukem/Nintendo_Switch_Reverse_Engineering. Input report 0x30 is 3 buttons bytes at +3, the right stick at +9 (two 12-bit values in 3 bytes), then three IMU samples of
-// 12 bytes from +13, 5 ms apart, oldest first (as motion_pro.h). Report 0x21 has the same head and answers a sub-command: its id at +14, an SPI read's address, length and data from +15.
-// Axes: the IC is mounted turned on the right Joy-Con, so against the Pro Controller's mapping (motion_pro.h) its raw y and z are negated (as Linux hid-nintendo has it). In the Switch
-// frame, x right, y forward, z up out of the face with gravity down, held as attached to a console: acc = (-raw1, -raw0, raw2), rot = (raw4, raw3, -raw5).
-// Scales: factory or user calibration from SPI flash, the nominal ones when a value is blank; a held offset is subtracted from the gyro, as the acceleration's is not.
+// A Joy-Con over Bluetooth, right or left, read as raw HID (joycon_mac.h). GameController lists a lone one with no extended gamepad profile, so front_mac.m has no buttons or stick
+// from it, and merges a left and a right one into one controller with no motion; macOS's GCMotion is zero-only on the Pro Controller (motion_pro.h). Pure, so tests/t_joycon.c checks
+// it without a controller.
+// Protocol: dekuNukem/Nintendo_Switch_Reverse_Engineering. Input report 0x30 is 3 buttons bytes at +3 (the right Joy-Con's, the shared ones, the left Joy-Con's), the left stick at +6
+// and the right stick at +9 (two 12-bit values in 3 bytes each), then three IMU samples of 12 bytes from +13, 5 ms apart, oldest first (as motion_pro.h). Report 0x21 has the same
+// head and answers a sub-command: its id at +14, an SPI read's address, length and data from +15.
+// Axes: the IC is mounted turned on the right Joy-Con, so against the Pro Controller's mapping (motion_pro.h) its raw y and z are negated (as Linux hid-nintendo has it); the left
+// Joy-Con's are the Pro Controller's. In the Switch frame, x right, y forward, z up out of the face with gravity down, held as attached to a console: right acc = (-raw1, -raw0, raw2),
+// rot = (raw4, raw3, -raw5); left acc = (raw1, -raw0, -raw2), rot = (-raw4, raw3, raw5).
+// Scales: factory or user calibration from SPI flash, the nominal ones when a value is blank; a held offset is subtracted from the gyro, as the acceleration's is not. The left
+// stick's calibration has its own addresses and its values in another order (jc_cal_stick_side).
 #pragma once
 #include <math.h>
 #include <stddef.h>
@@ -12,7 +16,7 @@
 #include <string.h>
 #include "dm_input.h"
 
-enum { JC_VENDOR = 0x057E, JC_PRODUCT_RIGHT = 0x2007, JC_OUTPUT_LEN = 49, JC_STICK_CENTER = 2048, JC_STICK_RANGE = 1400, JC_ACC_SCALE = 16384, JC_GYRO_SCALE = 13371 };
+enum { JC_VENDOR = 0x057E, JC_PRODUCT_LEFT = 0x2006, JC_PRODUCT_RIGHT = 0x2007, JC_OUTPUT_LEN = 49, JC_STICK_CENTER = 2048, JC_STICK_RANGE = 1400, JC_ACC_SCALE = 16384, JC_GYRO_SCALE = 13371 };
 typedef struct {
     int center[2], lo[2], hi[2];   // the stick's rest and its reach below and above it, x and y
     int acc_off[3], acc_scale[3], gyro_off[3], gyro_scale[3];   // by raw axis
@@ -31,15 +35,17 @@ static inline void jc_cal_defaults(jc_cal *c) {
 }
 static inline void jc_pair(const uint8_t b[3], int out[2]) { out[0] = b[0] | (b[1] & 0xf) << 8; out[1] = b[1] >> 4 | b[2] << 4; }
 static inline int jc_valid12(int v) { return v != 0 && v != 0xfff; }
-// The right stick's 9 bytes in flash: rest, reach below, reach above
-static inline void jc_cal_stick(jc_cal *c, const uint8_t b[9]) {
+// A stick's 9 bytes in flash: the right stick's rest, reach below, reach above; the left stick's reach above, rest, reach below
+static inline void jc_cal_stick_side(jc_cal *c, const uint8_t b[9], int left) {
     int v[3][2]; for (int k = 0; k < 3; k++) jc_pair(b + 3 * k, v[k]);
+    const int *rest = v[left ? 1 : 0], *below = v[left ? 2 : 1], *above = v[left ? 0 : 2];
     for (int i = 0; i < 2; i++) {
-        c->center[i] = jc_valid12(v[0][i]) ? v[0][i] : JC_STICK_CENTER;
-        c->lo[i] = jc_valid12(v[1][i]) ? v[1][i] : JC_STICK_RANGE;
-        c->hi[i] = jc_valid12(v[2][i]) ? v[2][i] : JC_STICK_RANGE;
+        c->center[i] = jc_valid12(rest[i]) ? rest[i] : JC_STICK_CENTER;
+        c->lo[i] = jc_valid12(below[i]) ? below[i] : JC_STICK_RANGE;
+        c->hi[i] = jc_valid12(above[i]) ? above[i] : JC_STICK_RANGE;
     }
 }
+static inline void jc_cal_stick(jc_cal *c, const uint8_t b[9]) { jc_cal_stick_side(c, b, 0); }
 static inline int jc_s16(const uint8_t *b) { return (int16_t)((uint16_t)b[0] | (uint16_t)b[1] << 8); }
 // The IMU's 24 bytes in flash: acceleration offsets, acceleration scales, gyro offsets, gyro scales. An erased scale (-1) or one with no span keeps the nominal one
 static inline void jc_cal_imu(jc_cal *c, const uint8_t b[24]) {
@@ -69,12 +75,25 @@ static inline uint32_t jc_buttons(uint8_t right, uint8_t shared) {
     if (shared & 0x04) m |= DM_BTN_RS;
     return m;
 }
-// 1 if r is a report with the controller's state. A sub-command's reply carries the buttons and the stick too
-static inline int jc_decode(const jc_cal *c, const uint8_t *r, size_t len, jc_input *o) {
+// The left Joy-Con's: its arrows, L and ZL, Minus and its stick's press (SL, SR and Capture reach nothing, as SL, SR and Home on the right one)
+static inline uint32_t jc_buttons_left(uint8_t left, uint8_t shared) {
+    uint32_t m = 0;
+    if (left & 0x01) m |= DM_BTN_DOWN;
+    if (left & 0x02) m |= DM_BTN_UP;
+    if (left & 0x04) m |= DM_BTN_RIGHT;
+    if (left & 0x08) m |= DM_BTN_LEFT;
+    if (left & 0x40) m |= DM_BTN_L;
+    if (left & 0x80) m |= DM_BTN_ZL;
+    if (shared & 0x01) m |= DM_BTN_MINUS;
+    if (shared & 0x08) m |= DM_BTN_LS;
+    return m;
+}
+// 1 if r is a report with the controller's state (left: a left Joy-Con's). A sub-command's reply carries the buttons and the stick too
+static inline int jc_decode_side(const jc_cal *c, const uint8_t *r, size_t len, jc_input *o, int left) {
     if (len < 12 || (r[0] != 0x30 && r[0] != 0x21)) return 0;
     memset(o, 0, sizeof *o);
-    o->buttons = jc_buttons(r[3], r[4]);
-    int s[2]; jc_pair(r + 9, s);
+    o->buttons = left ? jc_buttons_left(r[5], r[4]) : jc_buttons(r[3], r[4]);
+    int s[2]; jc_pair(r + (left ? 6 : 9), s);
     for (int i = 0; i < 2; i++) o->stick[i] = jc_axis(s[i], c->center[i], c->lo[i], c->hi[i]);
     if (r[0] != 0x30 || len < 49) return 1;
     int data = 0; float acc[3], gyro[3];
@@ -86,22 +105,24 @@ static inline int jc_decode(const jc_cal *c, const uint8_t *r, size_t len, jc_in
             acc[i] = (float)ra * 4.f / (float)(c->acc_scale[i] - c->acc_off[i]);
             gyro[i] = (float)(rg - c->gyro_off[i]) * 936.f / (float)(c->gyro_scale[i] - c->gyro_off[i]) * (float)M_PI / 180.f;
         }
-        o->acc[k][0] = -acc[1]; o->acc[k][1] = -acc[0]; o->acc[k][2] = acc[2];
-        o->rot[k][0] = gyro[1]; o->rot[k][1] = gyro[0]; o->rot[k][2] = -gyro[2];
+        if (left) { o->acc[k][0] = acc[1]; o->acc[k][1] = -acc[0]; o->acc[k][2] = -acc[2]; o->rot[k][0] = -gyro[1]; o->rot[k][1] = gyro[0]; o->rot[k][2] = gyro[2]; }
+        else { o->acc[k][0] = -acc[1]; o->acc[k][1] = -acc[0]; o->acc[k][2] = acc[2]; o->rot[k][0] = gyro[1]; o->rot[k][1] = gyro[0]; o->rot[k][2] = -gyro[2]; }
     }
     o->samples = data ? 3 : 0;   // all zero: the IMU is off, no motion source
     return 1;
 }
+static inline int jc_decode(const jc_cal *c, const uint8_t *r, size_t len, jc_input *o) { return jc_decode_side(c, r, len, o, 0); }
 
 // Setup, one sub-command at a time: calibration from flash (the user's if its magic is there, else the factory's), then the IMU and the full report mode, then the player light
 enum { JC_STICK_MAGIC, JC_STICK_USER, JC_STICK_FACTORY, JC_IMU_MAGIC, JC_IMU_USER, JC_IMU_FACTORY, JC_IMU_CONFIG, JC_IMU_ON, JC_MODE, JC_LIGHT, JC_DONE };
-typedef struct { int step; jc_cal cal; } jc_init;
-static inline void jc_init_start(jc_init *s) { s->step = JC_STICK_MAGIC; jc_cal_defaults(&s->cal); }
-static inline int jc_spi_of(int step, unsigned *addr, int *len) {
-    switch (step) {
-    case JC_STICK_MAGIC: *addr = 0x801B; *len = 2; return 1;
-    case JC_STICK_USER: *addr = 0x801D; *len = 9; return 1;
-    case JC_STICK_FACTORY: *addr = 0x6046; *len = 9; return 1;
+typedef struct { int step, left; jc_cal cal; } jc_init;   // left: a left Joy-Con's (its stick's calibration)
+static inline void jc_init_start_side(jc_init *s, int left) { s->step = JC_STICK_MAGIC; s->left = left; jc_cal_defaults(&s->cal); }
+static inline void jc_init_start(jc_init *s) { jc_init_start_side(s, 0); }
+static inline int jc_spi_of(const jc_init *s, unsigned *addr, int *len) {
+    switch (s->step) {
+    case JC_STICK_MAGIC: *addr = s->left ? 0x8010 : 0x801B; *len = 2; return 1;
+    case JC_STICK_USER: *addr = s->left ? 0x8012 : 0x801D; *len = 9; return 1;
+    case JC_STICK_FACTORY: *addr = s->left ? 0x603D : 0x6046; *len = 9; return 1;
     case JC_IMU_MAGIC: *addr = 0x8026; *len = 2; return 1;
     case JC_IMU_USER: *addr = 0x8028; *len = 24; return 1;
     case JC_IMU_FACTORY: *addr = 0x6020; *len = 24; return 1;
@@ -111,7 +132,7 @@ static inline int jc_spi_of(int step, unsigned *addr, int *len) {
 // The sub-command of the current step: its id and arguments; returns their count, 0 when setup is over
 static inline int jc_init_command(const jc_init *s, int player, uint8_t out[8]) {
     unsigned a; int n;
-    if (jc_spi_of(s->step, &a, &n)) { out[0] = 0x10; out[1] = a & 0xff; out[2] = a >> 8 & 0xff; out[3] = out[4] = 0; out[5] = (uint8_t)n; return 6; }
+    if (jc_spi_of(s, &a, &n)) { out[0] = 0x10; out[1] = a & 0xff; out[2] = a >> 8 & 0xff; out[3] = out[4] = 0; out[5] = (uint8_t)n; return 6; }
     switch (s->step) {
     case JC_IMU_CONFIG: out[0] = 0x41; out[1] = 3; out[2] = 0; out[3] = 1; out[4] = 1; return 5;   // +-2000 dps, +-8 G, 208 Hz, 100 Hz: the scales above
     case JC_IMU_ON: out[0] = 0x40; out[1] = 1; return 2;
@@ -135,12 +156,12 @@ static inline int jc_init_reply(jc_init *s, const uint8_t *r, size_t len) {
     uint8_t cmd[8]; int n = jc_init_command(s, 0, cmd);
     if (!n || len < 15 || r[0] != 0x21 || r[14] != cmd[0]) return 0;
     unsigned a; int want;
-    if (!jc_spi_of(s->step, &a, &want)) { jc_init_skip(s); return 1; }
+    if (!jc_spi_of(s, &a, &want)) { jc_init_skip(s); return 1; }
     if (len < 20 + (size_t)want || r[15] != cmd[1] || r[16] != cmd[2] || r[19] != cmd[5]) return 0;
     const uint8_t *d = r + 20; int magic = want == 2 && d[0] == 0xB2 && d[1] == 0xA1;
     switch (s->step) {
     case JC_STICK_MAGIC: s->step = magic ? JC_STICK_USER : JC_STICK_FACTORY; return 1;
-    case JC_STICK_USER: case JC_STICK_FACTORY: jc_cal_stick(&s->cal, d); break;
+    case JC_STICK_USER: case JC_STICK_FACTORY: jc_cal_stick_side(&s->cal, d, s->left); break;
     case JC_IMU_MAGIC: s->step = magic ? JC_IMU_USER : JC_IMU_FACTORY; return 1;
     case JC_IMU_USER: case JC_IMU_FACTORY: jc_cal_imu(&s->cal, d); break;
     }

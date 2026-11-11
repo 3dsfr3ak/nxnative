@@ -558,6 +558,60 @@ static void t_npad_imu(void) {
     CHECK(h_hid_SixCalLoad(ic, &right) == 0xd8cau && h_hid_SixCalStore(&right, ic) == RES_OK && !h_hid_SixNew(&right), "six-axis calibration: not kept; no new device");
 }
 
+// Two right Joy-Cons over Bluetooth, each set up as front_mac.m's hidpad_attach does (right-only motion, off the rails), in a game of handheld and dual Joy-Con
+// styles in handheld mode (Nintendo Switch Sports Resort): each its own player on No1 and No2, each a pair whose right half is that Joy-Con
+static void t_two_joycons(void) {
+    g_mode = 0; ids((const uint32_t[]){0, 1, 2, 3, NPAD_HANDHELD}, 5); h_hid_SetStyles(STYLE_HANDHELD | STYLE_JOYDUAL); g_phone_mode = 0;
+    dm_pad_players(0x3);
+    for (int p = 0; p < 2; p++) { dm_motion_right_only(p, 1); dm_player_detached(p, 1); }
+    CHECK(dm_player_npad(0) == 0 && dm_player_npad(1) == 1, "two Joy-Cons: player 1 on No1, player 2 on No2");
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_JOYDUAL && h_hid_GetStyle(&(uint32_t){1}) == STYLE_JOYDUAL && h_hid_GetStyle(&(uint32_t){NPAD_HANDHELD}) == 0,
+          "two Joy-Cons: both report dual Joy-Cons, nothing on Handheld");
+    dm_pad_set(DM_BTN_A, 0, 0, 0, 0); dm_pad_set_player(1, DM_BTN_B, 300, 0, 0, 0);
+    CHECK(buttons_of(0, STYLE_JOYDUAL) == DM_BTN_A && buttons_of(1, STYLE_JOYDUAL) == DM_BTN_B, "two Joy-Cons: each player reads its own buttons");
+    int32_t info[2]; int8_t arg[8] = {2, 2};
+    CHECK(h_hid_ShowCtrl(info, arg) == RES_OK && info[0] == 2 && info[1] == 0, "two Joy-Cons: a game asking for two players gets them, player 1 on No1 selected");
+    float flat[3] = {0, 0, -1}, still[3] = {0, 0, 0}, turn[3] = {0, 0, 2 * (float)M_PI}, tilted[3] = {.5f, 0, -.8660254f};
+    motion_now += MOTION_STALE_NS + 1;
+    dm_motion_set_hid(0, flat, still, motion_now); dm_motion_set_hid(1, tilted, turn, motion_now);
+    SixAxisState st; uint32_t p1r = 2 | 1u << 16, p2l = 2 | 1u << 8, p2r = 2 | 1u << 8 | 1u << 16;   // the host's six-axis handles: style bit, npad id, device
+    h_hid_SixStates(&st, 1, &p2r); CHECK(st.acc[0] == .5f && st.gyro[2] > .99f, "two Joy-Cons: player 2's right half moves with its Joy-Con");
+    h_hid_SixStates(&st, 1, &p2l); CHECK(st.acc[0] == 0 && st.acc[2] == -1 && st.gyro[2] == 0, "two Joy-Cons: player 2's left half lies flat");
+    h_hid_SixStates(&st, 1, &p1r); CHECK(st.acc[0] == 0 && st.gyro[2] == 0, "two Joy-Cons: player 1 does not move with player 2");
+    // Player 2's Joy-Con goes away, as hidpad_detach does it: No2 cleared, player 1 stays on No1
+    dm_motion_clear_hid(1); dm_motion_right_only(1, 0); dm_player_detached(1, 0); dm_pad_players(0x1);
+    CHECK(h_hid_GetStyle(&(uint32_t){1}) == 0 && dm_player_npad(0) == 0 && h_hid_GetStyle(&(uint32_t){0}) == STYLE_JOYDUAL, "two Joy-Cons: player 2's gone, player 1 keeps No1");
+    dm_motion_clear_hid(0); dm_motion_right_only(0, 0); dm_player_detached(0, 0); dm_pad_set(0, 0, 0, 0, 0);
+    h_hid_SetStyles(0xffffffffu); g_mode = 1; g_phone_mode = -1;
+}
+
+// A right and a left Joy-Con, each a player of its own (front_mac.m hidpad_attach): player 2's left Joy-Con moves the left half of its pair, and the right half lies still
+static void t_left_joycon(void) {
+    g_mode = 0; ids((const uint32_t[]){0, 1, 2, 3, NPAD_HANDHELD}, 5); h_hid_SetStyles(STYLE_HANDHELD | STYLE_JOYDUAL); g_phone_mode = 0;
+    dm_pad_players(0x3);
+    dm_motion_right_only(0, 1); dm_player_detached(0, 1); dm_motion_left_only(1, 1); dm_player_detached(1, 1);
+    CHECK(dm_player_npad(1) == 1 && h_hid_GetStyle(&(uint32_t){1}) == STYLE_JOYDUAL, "left Joy-Con: player 2 a dual Joy-Con on No2");
+    dm_pad_set_player(1, DM_BTN_ZL | DM_BTN_UP, 0, 0, 0, 0);
+    CHECK(buttons_of(1, STYLE_JOYDUAL) == (DM_BTN_ZL | DM_BTN_UP), "left Joy-Con: its buttons");
+    float still[3] = {0, 0, 0}, flat[3] = {0, 0, -1}, turn[3] = {0, 0, 2 * (float)M_PI}, tilted[3] = {.5f, 0, -.8660254f};
+    motion_now += MOTION_STALE_NS + 1;
+    dm_motion_set_hid(0, flat, still, motion_now); dm_motion_set_hid(1, tilted, turn, motion_now);
+    SixAxisState st; uint32_t p2l = 2 | 1u << 8, p2r = 2 | 1u << 8 | 1u << 16, p1r = 2 | 1u << 16;   // the host's six-axis handles: style bit, npad id, device
+    h_hid_SixStates(&st, 1, &p2l); CHECK(st.acc[0] == .5f && st.gyro[2] > .99f && !h_hid_SixRest(&p2l), "left Joy-Con: player 2's left half moves with it");
+    h_hid_SixStates(&st, 1, &p2r); CHECK(st.acc[0] == 0 && st.acc[2] == -1 && st.gyro[2] == 0 && h_hid_SixRest(&p2r), "left Joy-Con: player 2's right half lies flat");
+    h_hid_SixStates(&st, 1, &p1r); CHECK(st.acc[0] == 0 && st.gyro[2] == 0, "left Joy-Con: player 1 does not move with it");
+    // NpadImu, what the SDK's SensorFusion reads: the left device has the samples, the right one lies still
+    NpadImuSample s[16]; uint32_t i2l = 5 | 1u << 8, i2r = 5 | 1u << 8 | 1u << 16;   // the SDK's handles on No2 for dual Joy-Cons
+    CHECK(h_hid_ImuEnable(NULL, 0) == RES_OK, "left Joy-Con: NpadImu enabled");
+    motion_now += 1000; dm_motion_set_hid(1, tilted, turn, motion_now);
+    CHECK(h_hid_ImuSamples(s, 16, i2l) == 1 && fabsf(s[0].acc[0] - .5f * IMU_G) < 1e-4f, "left Joy-Con: NpadImu's left device has its sample");
+    CHECK(h_hid_ImuSamples(s, 16, i2r) == 1 && s[0].acc[0] == 0 && s[0].gyro[2] == 0, "left Joy-Con: NpadImu's right device lies still");
+    h_hid_ImuDisable();
+    dm_motion_clear_hid(0); dm_motion_clear_hid(1); dm_motion_right_only(0, 0); dm_motion_left_only(1, 0); dm_player_detached(0, 0); dm_player_detached(1, 0);
+    dm_pad_set_player(1, 0, 0, 0, 0, 0); dm_pad_players(0x1);
+    h_hid_SetStyles(0xffffffffu); g_mode = 1; g_phone_mode = -1;
+}
+
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     t_slots();
@@ -569,6 +623,8 @@ int main(void) {
     t_motion_live();
     t_motion_hid();
     t_npad_imu();
+    t_two_joycons();
+    t_left_joycon();
     t_rec();
     {   // Nmouse with no device (SDK 21's forms): the pointer range is kept, the merged handle 0 takes settings, the standard mouse and the handle queries report nothing
         int w = 0, h = 0; uint64_t std = 7; uint32_t npad = 9;

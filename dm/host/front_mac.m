@@ -193,6 +193,10 @@ static void pad_keep_system_buttons(GCController *c) {
     c.extendedGamepad.buttonHome.pressedChangedHandler = ^(GCControllerButtonInput *b, float v, BOOL down) { (void)b; (void)v; (void)down; if (g_input_on) hq_poll(); };
 }
 static const char *pad_name(GCController *c) { return c.vendorName.UTF8String ?: "?"; }
+// A Joy-Con GameController lists, alone or a left and a right one merged into "Joy-Con (L/R)", is read as raw HID instead (joycon_mac.h, unless DM_HID_PADS=0), each Joy-Con a
+// player of its own with its motion. The merged controller had no motion, and was made of the same right Joy-Con that already played as player 1: in two-player Nintendo Switch
+// Sports Resort it was player 2, the left Joy-Con with the right one's buttons, and no swing (2026-11-11)
+static int gc_joycon_raw(GCController *c) { const char *e = getenv("DM_HID_PADS"); return [c.productCategory containsString:@"Joy-Con"] && !(e && !atoi(e)); }
 static void npad_name(int p, char *out, size_t cap) { uint32_t id = dm_player_npad(p); if (id == 0x20) snprintf(out, cap, "handheld"); else snprintf(out, cap, "%u", id); }
 static void pro_players_changed(GCController *gone) {
     int count = 0, player = -1;
@@ -205,15 +209,15 @@ static void pro_devices_changed(void) { pro_players_changed(nil); }
 // DM_PAD_MERGE: whether a controller still plays player 1 (gone: one just removed, not counted), a GameController one or a raw HID pad (pad_hid_mac.h)
 static int merge_pads_left(GCController *gone) {
     if (g_hidpads) return 1;
-    for (GCController *c in GCController.controllers) if (c.extendedGamepad && c != gone) return 1;
+    for (GCController *c in GCController.controllers) if (c.extendedGamepad && c != gone && !gc_joycon_raw(c)) return 1;
     return 0;
 }
 // Called at start and on every connect / disconnect (gone: the controller that was just removed, nil on a connect)
 static void pads_changed(GCController *gone) {
-    for (GCController *c in GCController.controllers) if (!c.extendedGamepad) pad_keep_system_buttons(c);   // a lone Joy-Con (joycon_mac.h): its Home must not open the Games app either
+    for (GCController *c in GCController.controllers) if (!c.extendedGamepad || gc_joycon_raw(c)) pad_keep_system_buttons(c);   // a Joy-Con read as raw HID (joycon_mac.h): its Home must not open the Games app either
     if (g_merge) {
         int any = 0;
-        for (GCController *c in GCController.controllers) if (c.extendedGamepad && c != gone) {
+        for (GCController *c in GCController.controllers) if (c.extendedGamepad && c != gone && !gc_joycon_raw(c)) {
             any = 1; pad_keep_system_buttons(c); c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
             dm_motion_attach(c, 0);   // every controller is player 1: the last one moved drives its six-axis sensor
             pad_read(c.extendedGamepad);
@@ -232,7 +236,7 @@ static void pads_changed(GCController *gone) {
         pad_slot_free(&g_slots, (__bridge const void *)g_held[p]); g_held[p] = nil;
         dm_pad_set_player(p, 0, 0, 0, 0, 0);   // nothing stays pressed
     }
-    for (GCController *c in now) if (c.extendedGamepad && c != gone && pad_slot_of(&g_slots, (__bridge const void *)c) < 0) {
+    for (GCController *c in now) if (c.extendedGamepad && c != gone && !gc_joycon_raw(c) && pad_slot_of(&g_slots, (__bridge const void *)c) < 0) {
         int p = pad_slot_take(&g_slots, (__bridge const void *)c, pad_name(c));
         if (p < 0) { LOG("controller '%s' connected: all %d players are taken, not used", pad_name(c), DM_PLAYERS); continue; }
         g_held[p] = c; pad_keep_system_buttons(c);
@@ -265,7 +269,7 @@ static void pads_release(void) {
 }
 // Each controller read as it is now (focus back, the Home quit prompt closed)
 static void pads_reread(void) {
-    if (g_merge) { for (GCController *c in GCController.controllers) if (c.extendedGamepad) pad_read(c.extendedGamepad); }
+    if (g_merge) { for (GCController *c in GCController.controllers) if (c.extendedGamepad && !gc_joycon_raw(c)) pad_read(c.extendedGamepad); }
     else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p].extendedGamepad) pad_read(g_held[p].extendedGamepad);
     for (hid_pad *d = g_hidpads; d; d = d->next) hidpad_read(d);
 }
@@ -298,13 +302,13 @@ static int hidpad_motion_player(hid_pad *d) { return g_input_on ? hidpad_slot(d)
 static void hidpad_attach(hid_pad *d) {
     int p = g_merge ? 0 : pad_slot_take(&g_slots, d, d->name); char nb[16];
     if (p < 0) { LOG("controller '%s' (HID) connected: all %d players are taken, not used", d->name, DM_PLAYERS); return; }
-    if (d->jc) { dm_motion_right_only(p, 1); dm_player_detached(p, 1); }
+    if (d->jc) { if (d->jc->left) dm_motion_left_only(p, 1); else dm_motion_right_only(p, 1); dm_player_detached(p, 1); }
     npad_name(p, nb, sizeof nb); LOG("controller '%s' (HID) connected: player %d (npad %s)", d->name, p + 1, nb);
     if (!g_merge) dm_pad_players(pad_slot_mask(&g_slots));   // merged, every controller is player 1, as pads_changed has it
     hidpad_read(d);
 }
 static void hidpad_detach(hid_pad *d) {   // d is already off g_hidpads
-    if (d->jc) { int was = hidpad_slot(d); if (was >= 0) { dm_motion_clear_hid(was); dm_motion_right_only(was, 0); dm_player_detached(was, 0); } }
+    if (d->jc) { int was = hidpad_slot(d); if (was >= 0) { dm_motion_clear_hid(was); dm_motion_right_only(was, 0); dm_player_detached(was, 0); } }   // either side: whole again
     if (g_merge) {   // as pads_changed: released when the last controller goes away
         LOG("controller '%s' (HID) disconnected", d->name);
         if (!merge_pads_left(nil)) dm_pad_set(0, 0, 0, 0, 0);
@@ -1403,7 +1407,7 @@ void front_run(void (*guest)(void)) {
         for (NSNotificationName nm in @[GCControllerDidConnectNotification, GCControllerDidDisconnectNotification])
             [NSNotificationCenter.defaultCenter addObserverForName:nm object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
                 GCController *c = n.object; int conn = n.name == GCControllerDidConnectNotification;
-                if (!c.extendedGamepad || g_merge) LOG("controller %s: %s%s", conn ? "connected" : "disconnected", pad_name(c), c.extendedGamepad ? "" : [c.vendorName isEqualToString:@"Joy-Con (R)"] ? " (read as raw HID)" : " (no extended gamepad profile: not used)");
+                if (!c.extendedGamepad || g_merge || gc_joycon_raw(c)) LOG("controller %s: %s%s", conn ? "connected" : "disconnected", pad_name(c), gc_joycon_raw(c) ? " (its Joy-Cons read as raw HID)" : c.extendedGamepad ? "" : " (no extended gamepad profile: not used)");
                 pads_changed(conn ? nil : c);
                 if (conn) hq_log_setting(); }];
         dm_haptics_apple_init();

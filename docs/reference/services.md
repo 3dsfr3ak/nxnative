@@ -349,7 +349,7 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Symptom:** a right Joy-Con paired over Bluetooth does nothing (`controller connected: Joy-Con (R) (no extended gamepad profile: not used)`).
 - **Cause:** GameController lists a lone Joy-Con with no extended gamepad profile, and front_mac.m reads only that profile. macOS lists it as two HID services, the device and `AppleGCHIDUserEventDriver` over it, neither marked synthetic, so a reader by product ID sees two controllers (players 1 and 2, and the game's controller applet saying 2 connected).
 - **Fix:** `joycon.h` (pure, the protocol and setup) and `joycon_mac.h` read it as raw HID, one pad per location ID: calibration from SPI flash, then the IMU and report 0x30 by output report 0x01, written with the device open nonexclusive. It then takes a player slot as a raw HID pad does, its buttons and stick in `pad_hid`. All three samples of a report reach the rings. Its motion plays the right half of a pair (`dm_motion_right_only`): the left half lies still. In the Switch frame, held as attached to a console: acceleration (-raw1, -raw0, raw2), rotation (raw4, raw3, -raw5).
-- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md). Not done: a left Joy-Con, a pair as one controller, SL and SR, Home and Capture, rumble.
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md). A left Joy-Con: [the next entry but one](#a-left-joy-con-as-a-player-of-its-own). Not done: a pair as one player, SL and SR, Home and Capture, rumble.
 - **Check:** `t_joycon`; `t_hid` for the right half.
 
 ### A Joy-Con that does nothing in handheld mode
@@ -359,6 +359,15 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** `hle_hid.c`, for every game. A Joy-Con over Bluetooth as player 1 (`dm_player_detached`, from `front_mac.m`) plays on No1 with the console still in handheld mode, as tabletop mode does on a Switch. A game that supports no No1 keeps Handheld. Other controllers are not changed.
 - **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md): 295 applet openings in under a minute.
 - **Check:** `t_hid`.
+
+### A left Joy-Con as a player of its own
+
+- **Symptom:** with a right and a left Joy-Con paired, player 2 is `Joy-Con (L/R)` with no `with motion (gyro)` in its connect line, and the right Joy-Con's buttons reach both players.
+- **Cause:** raw HID read only the right Joy-Con. GameController merges a left and a right Joy-Con into one controller that has an extended gamepad profile but no motion, and front_mac.m made it a player. With the right Joy-Con already a player over raw HID, that second player was the same right Joy-Con with the left one added.
+- **Fix:** `joycon.h` and `joycon_mac.h` read a left Joy-Con too (product 0x2006): its buttons byte (+5: the arrows, SL, SR, L, ZL) and Minus and its stick's press (+4), its stick (+6), the Pro Controller's axes (acceleration (raw1, -raw0, -raw2), rotation (-raw4, raw3, raw5)), and its stick's calibration at its own addresses (factory 0x603D, user 0x8010 / 0x8012) with its values in another order (reach above, rest, reach below). Its motion plays the left half of a pair (`dm_motion_left_only`, `hle_hid.c` `half_still`). A Joy-Con GameController lists, alone or merged, is no player while raw HID pads are on (`gc_joycon_raw`); its Home is still kept from the system.
+- **Found on:** [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md#two-player-play): a left Joy-Con as player 2 swings in two-player play, checked by the player (2026-11-11).
+- **Check:** `t_joycon` (the left Joy-Con's report and setup); `t_hid` (a right and a left Joy-Con as players 1 and 2).
+- **Open:** two Joy-Cons as one player (`DM_PAD_MERGE`) share one motion source; SL and SR, Home and Capture, rumble.
 
 ### SDK 20 six-axis sensor and amiibo (`nfp`) calls
 

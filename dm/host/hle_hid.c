@@ -585,13 +585,20 @@ typedef struct { NpadImuSample s[IMU_RING]; uint64_t wr, rd, still_ns; int64_t s
 static imu_ring g_imu[DM_PLAYERS][2];
 static pthread_mutex_t g_imu_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int g_imu_on;
-// A lone right Joy-Con plays the right half of a pair: its sensor moves, and the left half's lies still (dm_motion_right_only)
-static _Atomic int g_motion_right[DM_PLAYERS];
-void dm_motion_right_only(int p, int on) { if (p >= 0 && p < DM_PLAYERS) atomic_store(&g_motion_right[p], on); }
-static int motion_right_only(int p) {
+// A lone Joy-Con plays its own half of a pair: its sensor moves, and the other half's lies still (dm_motion_right_only, dm_motion_left_only). g_motion_half: 0 both halves (a whole
+// controller), 1 the right one, 2 the left one
+static _Atomic int g_motion_half[DM_PLAYERS];
+void dm_motion_right_only(int p, int on) { if (p >= 0 && p < DM_PLAYERS) atomic_store(&g_motion_half[p], on ? 1 : 0); }
+void dm_motion_left_only(int p, int on) { if (p >= 0 && p < DM_PLAYERS) atomic_store(&g_motion_half[p], on ? 2 : 0); }
+static int motion_half(int p) {
     uint32_t src = p ? 1u << p : 1u | merged_players();
-    for (int i = 0; i < DM_PLAYERS; i++) if (src >> i & 1 && atomic_load(&g_motion_right[i])) return 1;
+    for (int i = 0; i < DM_PLAYERS; i++) if (src >> i & 1) { int h = atomic_load(&g_motion_half[i]); if (h) return h; }
     return 0;
+}
+// Whether device d of a pair (0 the left Joy-Con, 1 the right one) lies still for player p: the half its lone Joy-Con does not play
+static int half_still(int p, int d) {
+    int h = motion_half(p);
+    return (h == 1 && d == 0) || (h == 2 && d == 1);
 }
 typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, received_ns, logged; } live_motion;
 static live_motion g_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
@@ -622,7 +629,8 @@ static int imu_source_wins(int p, int source) {
 static void imu_push(int p, const motion_state *st) {
     if (!atomic_load(&g_imu_on)) return;
     pthread_mutex_lock(&g_imu_mu);
-    for (int d = atomic_load(&g_motion_right[p]) ? 1 : 0; d < 2; d++) {
+    int half = atomic_load(&g_motion_half[p]);
+    for (int d = half == 1; d < (half == 2 ? 1 : 2); d++) {   // a lone Joy-Con's ring only
         imu_ring *r = &g_imu[p][d]; NpadImuSample *s = &r->s[r->wr++ % IMU_RING];
         s->sampling = ++r->seq; s->delta_ns = SIX_PERIOD_NS;
         for (int i = 0; i < 3; i++) { s->acc[i] = st->acc[i] * IMU_G; s->gyro[i] = st->gyro[i] * 2 * (float)M_PI; }
@@ -712,10 +720,10 @@ static void six_sample(SixAxisState *s, int64_t samp, int shakes) {
 // two sensors, the others one. A handle reads as connected while its controller is connected in that style; otherwise its entries are zero (not connected) and the count 0.
 // Only player 1's controller shakes (DM_BTN_SHAKE comes from the keyboard, the iPhone and DM_KEYS, all player 1)
 static int six_connected(uint32_t h) { return (h & 0xff) < 32 && (style_of(h >> 8 & 0xff) >> (h & 0xff) & 1); }
-// Live motion for this sensor: not for the left half of a pair played by a lone right Joy-Con
+// Live motion for this sensor: not for the half of a pair a lone Joy-Con does not play
 static int six_live(uint32_t h, int pl, motion_state *ms) {
     if (!motion_live(pl, ms)) return 0;
-    return !((h >> 16 & 0xff) == 0 && style_of(h >> 8 & 0xff) & (STYLE_HANDHELD | STYLE_JOYDUAL) && motion_right_only(pl));
+    return !(style_of(h >> 8 & 0xff) & (STYLE_HANDHELD | STYLE_JOYDUAL) && half_still(pl, (int)(h >> 16 & 0xff)));
 }
 static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (n <= 0) return 0;
@@ -976,7 +984,7 @@ HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHand
     for (int i = 0; i < DM_PLAYERS; i++) if (src >> i & 1) { imu_ring *r = &g_imu[i][dev]; while (got < n && r->rd != r->wr) out[got++] = r->s[r->rd++ % IMU_RING]; }
     pthread_mutex_unlock(&g_imu_mu);
     motion_state ms;
-    if (got || (motion_live(pl, &ms) && (dev || !motion_right_only(pl)))) return got;
+    if (got || (motion_live(pl, &ms) && !half_still(pl, dev))) return got;
     pthread_mutex_lock(&g_imu_mu);
     imu_ring *r = &g_imu[pl][dev]; uint64_t now = guest_ns(), due = r->still_ns ? (now - r->still_ns) / SIX_PERIOD_NS : 1;
     if (due > IMU_RING) { due = 1; r->still_ns = 0; }
