@@ -54,6 +54,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | `build` → `game` | 60 fps frame step and render scale | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) | the game's own timing object |
 | `build` → `game` | 60 fps frame step and render scale (ksys::VFR) | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) | the game's own frame code; the frame-step state page is general |
 | `build` → `game` | 60 fps frame step: the KIDS frame task and frame-rate block | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md) | the game's own frame code; only the host's frame-step state page is shared. Fire Emblem: Three Houses and Taiko Risshiden V DX run on KTGL too, with other frame code |
+| `build` → `game` | frame rate the game steps by, from the host's step | frame rate | blocked: frame-step stubs have no function-matched form on this branch | checked: v65536 main: the sites, their free registers, the controller and the rate's readers read by disassembly (2026-11-11) | 1 | [Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md) | the game's own frame-rate controller in its sead framework |
 | `build` → `game` | frame step floor 2 → 1 vsync, and its frame step | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) | the game's own clock floor and step |
 | `build` → `game` | screen shape: the sizes, the view, the layouts' projection and their edge widgets (DM_SCREEN_ASPECT) | rendering | blocked: the stubs have no function-matched form yet | judgement | 1 | [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) | the output size is the host's, but where the game takes its sizes, its cameras and its layouts are this build's code |
 | `build` → `game` | Hagi coroutine stack region 1 GB → 64 MB | memory | kept: 1.1.4 is the last update; a match over Hagi would serve no other build of this game | checked: the final build 1.1.4 (the only one the profile packs), 2026-11-04 | 1 | [Super Mario 3D All-Stars: Super Mario Sunshine](../../dm/games/010049900F546002/README.md) | a size inside Hagi's own code: nothing the host sees tells a 1 GB reservation it can shrink from one it cannot |
@@ -78,6 +79,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Need For Speed™ Hot Pursuit Remastered](#need-for-speed-hot-pursuit-remastered) | 1 | 0 | 0 | 0 | 5 | `build` → `game`, `build` → `engine` |
 | [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](#nierautomata-the-end-of-yorha-edition-010056b015fe8000) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
 | [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](#nierautomata-the-end-of-yorha-edition-0100b8e016f76000) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
+| [Nintendo Switch Sports Resort](#nintendo-switch-sports-resort) | 0 | 0 | 2 | 0 | 0 | `build` → `game` |
 | [Paper Mario: The Thousand-Year Door](#paper-mario-the-thousand-year-door) | 1 | 0 | 1 | 0 | 0 | `build` → `game` |
 | [Pokémon Brilliant Diamond](#pokémon-brilliant-diamond) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
 | [Subnautica](#subnautica) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
@@ -427,6 +429,16 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - cut `+0x9c08f4`: dynamic resolution lower bound follows the selected preset
   - launcher capabilities: DYNAMIC_RESOLUTION
   - host [hle_fpslock.c:69](../../dm/host/hle_fpslock.c#L69): frame interval and dynamic-resolution floor
+
+### Nintendo Switch Sports Resort
+
+[Nintendo Switch Sports Resort](../../dm/games/04008E001F098000/README.md), `04008E001F098000`, [patches.py](../../dm/games/04008E001F098000/patches.py).
+
+- **`build` → `game`**, frame rate, blocked: frame-step stubs have no function-matched form on this branch, checked: v65536 main: the sites, their free registers, the controller and the rate's readers read by disassembly (2026-11-11): frame rate the game steps by, from the host's step. The game's own frame-rate controller in its sead framework
+
+- **1.1.0 `main`** `3941550a…` ([patches.py:74](../../dm/games/04008E001F098000/patches.py#L74))
+  - frame step `+0x33b67c`: the game's own frame rate back before its controller runs, unless the game set one since (state page +0x38, +0x3c)
+  - frame step `+0x33b68c`: frame rate the game steps by: 60 / the host's step, at most 3, unless the game fixes its own rate below 60 (state page target fps; 0 = the game's rate)
 
 ### Paper Mario: The Thousand-Year Door
 

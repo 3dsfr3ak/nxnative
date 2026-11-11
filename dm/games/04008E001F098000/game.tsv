@@ -28,5 +28,8 @@ upscaler	metalfx
 # Dynamic resolution reads the GPU time between the frame's timestamp reports. With one time per submission it reads about 0 and the game stays at its largest size, well below 60 fps;
 # with each report on its segment's GPU start / end, in Handheld with MetalFX, it goes down to mostly 640x360 at about 44 to 60 fps, mostly 52 to 60 (README.md, Performance)
 gpu_timestamps	segment
+# The game steps its systems by a frame rate its framework picks from the frame's CPU time alone (60 in play), so frames that wait on the GPU played slow on a Mac that cannot
+# hold 60. The rate takes the host's frame step instead (FRAME_STEP in patches.py, v65536): 60 fps, 30 or 20 when 60 does not hold, so game time = real time
+fps_target	60
 # Not checked on this game yet: the sead / agl engine of Mario Kart World and Splatoon Raiders wraps its clears in render conditions
 render_cond	on
